@@ -2,3 +2,6 @@
 bigfix_export.csv
 test.csv
 .DS_Store
+test_devices.csv
+directory_export.csv
+test_users.csv

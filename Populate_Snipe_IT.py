@@ -9,17 +9,20 @@ from datetime import datetime
 load_dotenv() # This loads variables from .env into os.environ
 SNIPEIT_API_BASE_URL = os.environ.get('SNIPEIT_API_BASE_URL', '')
 SNIPEIT_API_TOKEN = os.environ.get('SNIPEIT_API_TOKEN', '')
+# New: Load static password for users from .env
+SNIPEIT_USER_PASSWORD = os.environ.get('SNIPEIT_USER_PASSWORD', '')
 
 if not SNIPEIT_API_TOKEN:
-    print("Warning: SNIPEIT_API_TOKEN environment variable not set.")
-    # You might want to exit or raise an error here if the token is critical
+    print("Warning: SNIPEIT_API_TOKEN environment variable not set. Please set it in your .env file.")
+elif not SNIPEIT_USER_PASSWORD:
+    print("Warning: SNIPEIT_USER_PASSWORD environment variable not set. Users might fail to create due to missing password.")
 else:
-    print("SNIPEIT_API_TOKEN successfully loaded.")
-    # Proceed with using SNIPEIT_API_TOKEN
+    print("SNIPEIT_API_TOKEN and SNIPEIT_USER_PASSWORD successfully loaded.")
 
-BIGFIX_CSV_FILE = 'test.csv'
+BIGFIX_CSV_FILE = 'test_devices.csv'
+DIRECTORY_CSV_FILE = 'test_users.csv' # New: Directory export CSV file
 
-# CSV Column Mappings (These must EXACTLY match the headers in your BigFix CSV)
+# CSV Column Mappings for Assets (These must EXACTLY match the headers in your BigFix CSV)
 MODEL_COLUMN = 'Model'
 MANUFACTURER_COLUMN = 'Manufacturer'
 CATEGORY_COLUMN = 'Device Type'
@@ -27,15 +30,23 @@ SERIAL_COLUMN = 'Serial' # Used as Asset Tag in Snipe-IT
 COMPUTER_NAME_COLUMN = 'Computer Name' # Used as Asset Name in Snipe-IT
 LAST_REPORT_TIME_COLUMN = 'Last Report Time' # Used for de-duplication and notes
 
+# CSV Column Mappings for Users (These must EXACTLY match the headers in your Directory Export CSV)
+USER_EMPLOYEE_NET_ID_COLUMN = 'EmployeeNetId'
+USER_EMPLOYEE_ID_COLUMN = 'EmployeeID'
+USER_FIRST_NAME_COLUMN = 'FirstName'
+USER_MIDDLE_NAME_COLUMN = 'MiddleName' # Not used in Snipe-IT directly, but included for completeness
+USER_LAST_NAME_COLUMN = 'LastName'
+USER_EMAIL_COLUMN = 'EmployeeEmailAddress'
+
 # Default Snipe-IT Values (ensure these exist in your Snipe-IT instance)
-DEFAULT_CATEGORY_NAME = 'Desktop' # Updated to "Desktop"
-DEFAULT_STATUS_LABEL = 'Deployed' # e.g., 'Deployed', 'Ready to Deploy', 'In Repair'
+DEFAULT_CATEGORY_NAME = 'Desktop'
+DEFAULT_STATUS_LABEL = 'Deployed'
 DEFAULT_LOCATION_NAME = 'Office'
 TARGET_COMPANY_NAME = 'NYU - Tandon School of Engineering' # Target company for all assets
 
 # --- API Rate Limiting ---
 REQUEST_DELAY_SECONDS = 0.6
-MAX_API_LIMIT_PER_REQUEST = 500 # Correct variable name
+MAX_API_LIMIT_PER_REQUEST = 500
 
 # --- Serial Number Skip List ---
 SERIAL_SKIP_LIST = ["0123456789", "To be filled by O.E.M.", "System Serial Number"]
@@ -73,11 +84,9 @@ def get_snipeit_data_paginated(endpoint):
 
             print(f"    Fetched {total_fetched}/{total_count} items from {endpoint} (offset: {offset})")
 
-            # Corrected variable name here
             if not rows or len(rows) < MAX_API_LIMIT_PER_REQUEST:
                 break
 
-            # Corrected variable name here
             offset += MAX_API_LIMIT_PER_REQUEST
 
         except requests.exceptions.RequestException as e:
@@ -168,6 +177,42 @@ def delete_snipeit_asset(asset_id):
     finally:
         time.sleep(REQUEST_DELAY_SECONDS)
 
+def create_snipeit_user(user_data):
+    """Creates a new user in Snipe-IT."""
+    url = f"{SNIPEIT_API_BASE_URL}/users"
+    response = None # Initialize response to None
+    try:
+        response = requests.post(url, headers=HEADERS, json=user_data)
+        response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
+        print(f"Successfully created user: {user_data.get('username', 'N/A')} (HTTP Status: {response.status_code})")
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        status_code = response.status_code if response is not None else 'N/A'
+        if response is not None and response.json():
+            response_json = response.json()
+            # Check for specific user already exists error (username, employee_num, or email)
+            if 'messages' in response_json:
+                if 'username' in response_json['messages'] and 'already been taken' in response_json['messages']['username'][0]:
+                    print(f"User with username '{user_data.get('username')}' already exists. Skipping creation (HTTP Status: {status_code}).")
+                    return None
+                if 'employee_num' in response_json['messages'] and 'already been taken' in response_json['messages']['employee_num'][0]:
+                    print(f"User with employee number '{user_data.get('employee_num')}' already exists. Skipping creation (HTTP Status: {status_code}).")
+                    return None
+                if 'email' in response_json['messages'] and 'already been taken' in response_json['messages']['email'][0]:
+                    print(f"User with email '{user_data.get('email')}' already exists. Skipping creation (HTTP Status: {status_code}).")
+                    return None
+                # Check for password validation errors
+                if 'password' in response_json['messages']:
+                    print(f"Password validation error for user '{user_data.get('username')}': {response_json['messages']['password']} (HTTP Status: {status_code}).")
+                    return None
+            print(f"Error creating user {user_data.get('username', 'N/A')}: {e} (HTTP Status: {status_code})")
+            print(f"Snipe-IT API response: {response_json}")
+        else:
+            print(f"Error creating user {user_data.get('username', 'N/A')}: {e} (No JSON response body / HTTP Status: {status_code})")
+        return None
+    finally:
+        time.sleep(REQUEST_DELAY_SECONDS)
+
 def parse_last_report_time(time_str):
     """
     Parses BigFix 'Last Report Time' string into a datetime object.
@@ -182,7 +227,7 @@ def parse_last_report_time(time_str):
 # --- Main Script Logic ---
 
 def main():
-    # --- Step 1: Collect Current Snipe-IT Data (with pagination) ---
+    # --- Step 1: Collect Current Snipe-IT Data ---
     snipeit_manufacturers = {}
     snipeit_categories = {}
     snipeit_models = {}
@@ -190,6 +235,7 @@ def main():
     snipeit_locations = {}
     snipeit_companies = {}
     snipeit_assets = {}
+    snipeit_users = {} # Dictionary to store existing users
 
     print("--- Collecting Existing Snipe-IT Data (Paginated) ---")
     manu_list = get_snipeit_data_paginated('manufacturers')
@@ -252,11 +298,26 @@ def main():
             }
     print(f"Total {len(snipeit_assets)} existing assets collected from Snipe-IT.")
 
-    # --- Step 2: Parse BigFix CSV, Filter, and De-duplicate ---
+    # Collect Existing Users from Snipe-IT
+    print("Collecting existing users from Snipe-IT (paginated)...")
+    existing_users_raw = get_snipeit_data_paginated('users')
+    for user in existing_users_raw:
+        employee_num = user.get('employee_num')
+        username = user.get('username')
+        if employee_num:
+            snipeit_users[employee_num.strip()] = {
+                'id': user.get('id'),
+                'username': username.strip().lower() if username else None,
+                'email': user.get('email', '').strip().lower(),
+                'first_name': user.get('first_name', '').strip().lower(),
+                'last_name': user.get('last_name', '').strip().lower(),
+            }
+    print(f"Total {len(snipeit_users)} existing users collected from Snipe-IT.")
+
+    # --- Step 2: Process BigFix CSV for Assets (Order Changed) ---
+    print(f"\n--- Processing BigFix CSV: {BIGFIX_CSV_FILE} for Assets ---")
     bigfix_data = {}
     skipped_serial_count = 0
-
-    print(f"\n--- Parsing and De-duplicating BigFix CSV: {BIGFIX_CSV_FILE} ---")
     try:
         with open(BIGFIX_CSV_FILE, mode='r', encoding='utf-8') as csvfile:
             reader = csv.DictReader(csvfile)
@@ -267,6 +328,7 @@ def main():
             if missing_cols:
                 print(f"Error: Missing required columns in CSV: {', '.join(missing_cols)}")
                 print(f"Available columns in CSV: {', '.join(reader.fieldnames)}")
+                # Exit here if core asset columns are missing
                 return
 
             for row_num, row in enumerate(reader, start=2):
@@ -303,15 +365,16 @@ def main():
             print(f"Skipped {skipped_serial_count} BigFix entries due to missing or invalid serials/times, or serials in the skip list.")
 
     except FileNotFoundError:
-        print(f"Error: CSV file '{BIGFIX_CSV_FILE}' not found. Please ensure the file is in the same directory or provide the full path.")
-        return
+        print(f"Error: CSV file '{BIGFIX_CSV_FILE}' not found. Skipping asset import.")
+        bigfix_data = {} # Ensure bigfix_data is empty if file not found
     except Exception as e:
-        print(f"An error occurred while reading the CSV file: {e}")
-        return
+        print(f"An error occurred while reading the BigFix CSV file: {e}")
+        return # Exit if critical error with BigFix CSV
 
-    # --- Step 3: Populate Manufacturers in Snipe-IT ---
-    print("\n--- Populating Manufacturers in Snipe-IT ---")
+    # --- Step 3: Populate Manufacturers in Snipe-IT (Asset-related, now using bigfix_data) ---
+    print("\n--- Populating Manufacturers in Snipe-IT (Asset-related) ---")
     manufacturers_added_count = 0
+    # Ensure bigfix_data is processed only if it was successfully loaded
     bigfix_unique_manufacturers_from_csv = set(d['row'].get(MANUFACTURER_COLUMN).strip() for d in bigfix_data.values() if d['row'].get(MANUFACTURER_COLUMN))
 
     for manu_name in sorted(list(bigfix_unique_manufacturers_from_csv)):
@@ -323,8 +386,8 @@ def main():
                 snipeit_manufacturers[manu_name.lower()] = new_id
     print(f"Successfully added {manufacturers_added_count} new manufacturers to Snipe-IT.")
 
-    # --- Step 4: Populate Models in Snipe-IT ---
-    print("\n--- Populating Models in Snipe-IT ---")
+    # --- Step 4: Populate Models in Snipe-IT (Asset-related, now using bigfix_data) ---
+    print("\n--- Populating Models in Snipe-IT (Asset-related) ---")
     models_added_count = 0
     bigfix_models_to_process = {}
     for serial_upper, device_data in bigfix_data.items():
@@ -380,7 +443,7 @@ def main():
 
     print(f"Successfully added {models_added_count} new models to Snipe-IT.")
 
-    # --- Step 5: Populate Assets in Snipe-IT ---
+    # --- Step 5: Populate Assets in Snipe-IT (Order Changed) ---
     print("\n--- Populating Assets in Snipe-IT ---")
     assets_added_count = 0
     assets_deleted_count = 0
@@ -450,7 +513,7 @@ def main():
 
         asset_payload = {
             'asset_tag': serial,
-            'name': computer_name_for_asset, # Corrected key for asset name
+            'name': computer_name_for_asset,
             'model_id': model_id,
             'status_id': default_status_id,
             'location_id': default_location_id,
@@ -468,13 +531,115 @@ def main():
                 'last_report_time': bigfix_last_report_time
             }
 
-    print(f"\n--- Script Finished ---")
-    print(f"Summary: ")
+    # --- Step 6: Process Directory Export CSV for Users (Order Changed) ---
+    print(f"\n--- Processing Directory Export CSV: {DIRECTORY_CSV_FILE} for Users ---")
+    users_added_count = 0
+    users_skipped_count = 0
+    
+    try:
+        with open(DIRECTORY_CSV_FILE, mode='r', encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+
+            user_required_cols = [
+                USER_EMPLOYEE_NET_ID_COLUMN,
+                USER_EMPLOYEE_ID_COLUMN,
+                USER_FIRST_NAME_COLUMN,
+                USER_LAST_NAME_COLUMN,
+                USER_EMAIL_COLUMN
+            ]
+            user_missing_cols = [col for col in user_required_cols if col not in reader.fieldnames]
+
+            if user_missing_cols:
+                print(f"Error: Missing required user columns in '{DIRECTORY_CSV_FILE}': {', '.join(user_missing_cols)}")
+                print(f"Available columns in CSV: {', '.join(reader.fieldnames)}")
+                # Continue the script, but skip user import, or decide to exit based on criticality
+                return # Exit if critical columns are missing for users.
+
+            for row_num, row in enumerate(reader, start=2):
+                employee_id = row.get(USER_EMPLOYEE_ID_COLUMN)
+                employee_net_id = row.get(USER_EMPLOYEE_NET_ID_COLUMN)
+                first_name = row.get(USER_FIRST_NAME_COLUMN)
+                last_name = row.get(USER_LAST_NAME_COLUMN)
+                email = row.get(USER_EMAIL_COLUMN)
+
+                # Basic validation for user data
+                if not all([employee_id, employee_net_id, first_name, last_name, email]):
+                    print(f"Skipping user in row {row_num}: Missing required user data (EmployeeID, EmployeeNetId, FirstName, LastName, EmployeeEmailAddress).")
+                    users_skipped_count += 1
+                    continue
+                
+                # Strip whitespace from relevant fields
+                employee_id = employee_id.strip()
+                employee_net_id = employee_net_id.strip()
+                first_name = first_name.strip()
+                last_name = last_name.strip()
+                email = email.strip()
+
+                # Check if user already exists based on employee_num
+                if employee_id in snipeit_users:
+                    print(f"User with EmployeeID '{employee_id}' (NetID: {employee_net_id}) already exists in Snipe-IT. Skipping creation.")
+                    users_skipped_count += 1
+                    continue
+                
+                # Check for existing username or email, even if employee_num is new
+                is_duplicate_by_username = False
+                is_duplicate_by_email = False
+                for existing_user_data in snipeit_users.values():
+                    if existing_user_data['username'] == employee_net_id.lower():
+                        is_duplicate_by_username = True
+                        break
+                    if existing_user_data['email'] == email.lower():
+                        is_duplicate_by_email = True
+                        break
+                
+                if is_duplicate_by_username:
+                    print(f"User with username '{employee_net_id}' already exists (different EmployeeID perhaps). Skipping creation.")
+                    users_skipped_count += 1
+                    continue
+                if is_duplicate_by_email:
+                    print(f"User with email '{email}' already exists (different EmployeeID perhaps). Skipping creation.")
+                    users_skipped_count += 1
+                    continue
+
+                user_payload = {
+                    'first_name': first_name,
+                    'last_name': last_name,
+                    'username': employee_net_id,
+                    'employee_num': employee_id,
+                    'email': email,
+                    'password': SNIPEIT_USER_PASSWORD, # Using static password from .env
+                    'password_confirmation': SNIPEIT_USER_PASSWORD, # Using static password from .env
+                    'activated': False, # Automatically activate the user
+                    'autoassign_licenses': False, 
+                }
+                
+                print(f"DEBUG: Attempting to create user: {employee_net_id} (ID: {employee_id})")
+                if create_snipeit_user(user_payload):
+                    users_added_count += 1
+                    # Add to our local cache for immediate de-duplication within the same run
+                    snipeit_users[employee_id] = {
+                        'id': None, # We don't get the ID back easily from create_snipeit_user, but it's not critical for this script's logic
+                        'username': employee_net_id.lower(),
+                        'email': email.lower(),
+                        'first_name': first_name.lower(),
+                        'last_name': last_name.lower(),
+                    }
+
+    except FileNotFoundError:
+        print(f"Error: Directory export CSV file '{DIRECTORY_CSV_FILE}' not found. Skipping user import.")
+    except Exception as e:
+        print(f"An error occurred while reading the directory CSV file: {e}")
+
+    print(f"\n--- Overall Summary ---")
+    print(f"Asset Import:")
     print(f"  New Manufacturers Added: {manufacturers_added_count}")
     print(f"  New Models Added: {models_added_count}")
     print(f"  New Assets Added: {assets_added_count}")
     print(f"  Old Assets Deleted (Repurposed): {assets_deleted_count}")
     print(f"  Assets Skipped (Initial CSV Filter/Later Checks): {skipped_serial_count + assets_skipped_final_count}")
+    print(f"\nUser Import:")
+    print(f"  New Users Added: {users_added_count}")
+    print(f"  Users Skipped: {users_skipped_count}")
 
 
 if __name__ == "__main__":
