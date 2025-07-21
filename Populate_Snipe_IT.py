@@ -17,7 +17,7 @@ elif not SNIPEIT_USER_PASSWORD:
 else:
     print("SNIPEIT_API_TOKEN and SNIPEIT_USER_PASSWORD successfully loaded.")
 
-BIGFIX_CSV_FILE = 'bigfix_export.csv'
+BIGFIX_CSV_FILE = 'test_devices.csv'
 DIRECTORY_CSV_FILE = 'directory_export.csv'
 
 MODEL_COLUMN = 'Model'
@@ -42,7 +42,7 @@ CHECKED_OUT_STATUS_LABEL = 'Deployed' # This is usually 'Undeployable'
 DEFAULT_LOCATION_NAME = 'Office'
 TARGET_COMPANY_NAME = 'NYU - Tandon School of Engineering'
 
-REQUEST_DELAY_SECONDS = 0.6
+REQUEST_DELAY_SECONDS = 0.15 # Adjusted from 0.6 to allow more requests per minute
 MAX_API_LIMIT_PER_REQUEST = 500
 
 SERIAL_SKIP_LIST = ["0123456789", "To be filled by O.E.M.", "System Serial Number"]
@@ -90,18 +90,18 @@ def get_snipeit_data_paginated(endpoint):
     return all_items
 
 def get_asset_details_from_snipeit(asset_id):
-    """Fetches the current details of an asset from Snipe-IT, similar to the test script."""
+    """Fetches the current details of an asset from Snipe-IT."""
     url = f"{SNIPEIT_API_BASE_URL}/hardware/{asset_id}"
     response = None
     try:
         response = requests.get(url, headers=HEADERS)
         response.raise_for_status()
-        asset_data = response.json() # Direct access, no 'payload' key
+        asset_data = response.json() 
         
         if asset_data and 'id' in asset_data:
             current_status_id = asset_data.get('status_label', {}).get('id')
             current_assigned_to_id = None
-            if asset_data.get('assigned_to') and asset_data['assigned_to']['type'] == 'user': # Corrected line
+            if asset_data.get('assigned_to') and asset_data['assigned_to']['type'] == 'user':
                 current_assigned_to_id = asset_data['assigned_to'].get('id')
             elif asset_data.get('assigned_to') and asset_data['assigned_to'].get('type') == 'location':
                 current_assigned_to_id = asset_data['assigned_to'].get('id')
@@ -115,6 +115,20 @@ def get_asset_details_from_snipeit(asset_id):
         if response is not None and hasattr(response, 'status_code'):
             print(f"Snipe-IT API ERROR response (Fetch Details - HTTP Status {response.status_code}): {response.text}")
         return None, None
+    finally:
+        time.sleep(REQUEST_DELAY_SECONDS)
+
+def get_asset_details_from_snipeit_raw_notes(asset_id):
+    """Fetches the current details of an asset, specifically for its raw notes content."""
+    url = f"{SNIPEIT_API_BASE_URL}/hardware/{asset_id}"
+    try:
+        response = requests.get(url, headers=HEADERS)
+        response.raise_for_status()
+        asset_data = response.json()
+        return asset_data.get('notes', '')
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching raw notes for asset ID {asset_id}: {e}")
+        return ''
     finally:
         time.sleep(REQUEST_DELAY_SECONDS)
 
@@ -344,7 +358,6 @@ def update_asset_status(asset_id, status_id, notes=""):
     finally:
         time.sleep(REQUEST_DELAY_SECONDS)
 
-
 def parse_last_report_time(time_str):
     """
     Parses BigFix 'Last Report Time' string into a datetime object.
@@ -355,6 +368,28 @@ def parse_last_report_time(time_str):
     except ValueError:
         print(f"Warning: Could not parse Last Report Time '{time_str}'. Using minimum date.")
         return datetime.min
+
+def update_bigfix_last_report_in_notes(current_notes, new_report_time):
+    """
+    Updates or adds the BigFix Last Report Time in the asset's notes string.
+    Preserves other notes content.
+    """
+    lines = current_notes.split('\n')
+    new_report_line = f"BigFix Last Report: {new_report_time.strftime('%Y-%m-%d %H:%M:%S')}"
+    
+    updated_lines = []
+    found_bigfix_line = False
+    for line in lines:
+        if 'BigFix Last Report:' in line:
+            updated_lines.append(new_report_line)
+            found_bigfix_line = True
+        else:
+            updated_lines.append(line)
+    
+    if not found_bigfix_line:
+        updated_lines.append(new_report_line)
+    
+    return '\n'.join(updated_lines).strip()
 
 def main():
     global SNIPEIT_STATUS_NAMES_BY_ID
@@ -708,7 +743,7 @@ def main():
 
     print(f"\n--- Populating Assets in Snipe-IT ---")
     assets_added_count = 0
-    assets_deleted_count = 0 # This counter is not used in the current script logic
+    assets_deleted_count = 0 
     assets_skipped_final_count = 0
 
     default_location_id = snipeit_locations.get(DEFAULT_LOCATION_NAME.lower())
@@ -830,35 +865,56 @@ def main():
                     else:
                         print(f"\n--- Workflow for Asset ID {asset_id_for_workflow} (Serial: {serial}) - Preparing for Checkout ---")
                         print(f"  Current Snipe-IT State: Status ID {current_snipeit_status}, Assigned To: {current_snipeit_assigned_to_id}")
-                        
-                        # If the asset is NOT in the "Ready to Deploy" status, attempt to directly update its status.
-                        if current_snipeit_status != checkin_status_id: # checkin_status_id is 'Ready to Deploy' (ID 2)
-                            print(f"  Asset is NOT in '{SNIPEIT_STATUS_NAMES_BY_ID.get(checkin_status_id)}' state. Attempting to directly update status to '{DEFAULT_STATUS_LABEL}'.")
+
+                        # Step 1: Ensure asset status is 'Ready to Deploy' (checkin_status_id)
+                        # This is a prerequisite for a successful check-in/checkout.
+                        if current_snipeit_status != checkin_status_id:
+                            print(f"  Asset is NOT in '{DEFAULT_STATUS_LABEL}' state. Attempting to set status to '{DEFAULT_STATUS_LABEL}' ({checkin_status_id}).")
+                            status_update_notes = f"Automatic status update to '{DEFAULT_STATUS_LABEL}' before check-in/checkout workflow. Last BigFix Report: {bigfix_last_report_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                            if update_asset_status(asset_id_for_workflow, checkin_status_id, notes=status_update_notes):
+                                print(f"  Successfully set asset ID {asset_id_for_workflow} status to '{DEFAULT_STATUS_LABEL}'.")
+                                # Re-fetch to confirm status change
+                                current_snipeit_status, current_snipeit_assigned_to_id = get_asset_details_from_snipeit(asset_id_for_workflow)
+                                if current_snipeit_status != checkin_status_id:
+                                    print(f"  ❌ Status update verification failed. Asset is still not in '{DEFAULT_STATUS_LABEL}' state after update attempt.")
+                                    print(f"     Actual: Status {current_snipeit_status} ('{SNIPEIT_STATUS_NAMES_BY_ID.get(current_snipeit_status, 'Unknown')}').")
+                                    print(f"  Skipping checkout for asset {serial} due to inconsistent state after status update.")
+                                    continue # Skip to next asset
+                            else:
+                                print(f"  Failed to set asset {serial} status to '{DEFAULT_STATUS_LABEL}'. Skipping checkout.")
+                                continue # Skip to next asset
+                        else:
+                            print(f"  Asset is already in '{DEFAULT_STATUS_LABEL}' state. Proceeding to check assignment.")
+
+                        # Step 2: Perform explicit check-in if asset is currently assigned.
+                        # The previous step ensures its status is 'Ready to Deploy' before this check-in.
+                        if current_snipeit_assigned_to_id is not None:
+                            print(f"  Asset is currently assigned to user ID {current_snipeit_assigned_to_id}. Attempting to check in asset.")
                             
-                            update_notes_for_status_change = (
-                                f"Automatic pre-checkout status update based on BigFix data. "
-                                f"Current assignment: {current_snipeit_assigned_to_id if current_snipeit_assigned_to_id else 'None'}. "
-                                f"Current status: {SNIPEIT_STATUS_NAMES_BY_ID.get(current_snipeit_status, current_snipeit_status)}. "
+                            checkin_notes = (
+                                f"Automatic check-in based on BigFix data before re-assignment. "
+                                f"Previous assignment: {current_snipeit_assigned_to_id if current_snipeit_assigned_to_id else 'None'}. "
                                 f"Last BigFix Report: {bigfix_last_report_time.strftime('%Y-%m-%d %H:%M:%S')}"
                             )
-                            
-                            # Use update_asset_status to directly set the status_id
-                            if update_asset_status(asset_id_for_workflow, checkin_status_id, notes=update_notes_for_status_change):
-                                print(f"  Successfully attempted direct status update for asset ID {asset_id_for_workflow} to {SNIPEIT_STATUS_NAMES_BY_ID.get(checkin_status_id)}.")
-                                # Re-fetch to confirm state after update
-                                current_snipeit_status, current_snipeit_assigned_to_id = get_asset_details_from_snipeit(asset_id_for_workflow)
-                                if current_snipeit_status != checkin_status_id or current_snipeit_assigned_to_id is not None:
-                                    print(f"  ❌ Post-status-update state verification failed. Asset is not fully in '{SNIPEIT_STATUS_NAMES_BY_ID.get(checkin_status_id)}' state.")
-                                    print(f"     Actual: Status {current_snipeit_status}, Assigned {current_snipeit_assigned_to_id}.")
-                                    print(f"  Skipping checkout for asset {serial} due to inconsistent state after status update.")
-                                    continue # Skip to next asset if status update didn't result in expected state
-                            else:
-                                print(f"  Failed to get asset {serial} into '{DEFAULT_STATUS_LABEL}' state via direct update. Skipping checkout.")
-                                continue # Skip to next asset if update API call failed
-                        else:
-                            print(f"  Asset is already in '{SNIPEIT_STATUS_NAMES_BY_ID.get(checkin_status_id)}' state and ready for checkout.")
 
-                        # Step 2: Perform the checkout (This part remains the same)
+                            if checkin_asset(asset_id_for_workflow, checkin_status_id, notes=checkin_notes):
+                                print(f"  Successfully attempted check-in for asset ID {asset_id_for_workflow}.")
+                                # Re-fetch to confirm state after check-in
+                                current_snipeit_status, current_snipeit_assigned_to_id = get_asset_details_from_snipeit(asset_id_for_workflow)
+                                if current_snipeit_status == checkin_status_id and current_snipeit_assigned_to_id is None:
+                                    print(f"  ✅ Post-check-in state confirmed: Asset is now '{SNIPEIT_STATUS_NAMES_BY_ID.get(checkin_status_id)}' and unassigned.")
+                                else:
+                                    print(f"  ❌ Post-check-in state verification failed. Asset is not fully in '{SNIPEIT_STATUS_NAMES_BY_ID.get(checkin_status_id)}' state or is still assigned.")
+                                    print(f"     Actual: Status {current_snipeit_status} ('{SNIPEIT_STATUS_NAMES_BY_ID.get(current_snipeit_status, 'Unknown')}'), Assigned {current_snipeit_assigned_to_id}.")
+                                    print(f"  Skipping checkout for asset {serial} due to inconsistent state after check-in.")
+                                    continue # Skip to next asset if check-in didn't result in expected state
+                            else:
+                                print(f"  Failed to check in asset {serial}. Skipping checkout.")
+                                continue # Skip to next asset if check-in API call failed
+                        else:
+                            print(f"  Asset is already unassigned. Proceeding to checkout.")
+
+                        # Step 3: Perform the checkout (This part remains the same)
                         print(f"  Attempting to check out asset ID {asset_id_for_workflow} to user ID {snipeit_user_id}.")
                         checkout_notes = f"Automatically checked out based on BigFix 'User Name': {bigfix_user_name}. Last BigFix Report: {bigfix_last_report_time.strftime('%Y-%m-%d %H:%M:%S')}"
                         if checkout_asset_to_user(asset_id_for_workflow, snipeit_user_id, checkout_notes):
@@ -882,62 +938,22 @@ def main():
                             print(f"  Failed to check out asset {asset_id_for_workflow} to user {snipeit_user_id}.")
                             snipeit_assets[serial_upper]['checked_out_to_id'] = current_snipeit_assigned_to_id
                 else:
-                    print(f"Could not find Snipe-IT user for BigFix 'User Name' '{bigfix_user_name}' (EmployeeID: {target_employee_id}). Skipping checkout.")
+                    print(f"No matching Snipe-IT user found for BigFix username '{bigfix_user_name}'. Skipping checkout for asset {serial}.")
             else:
-                print(f"BigFix 'User Name' '{bigfix_user_name}' not found in Directory CSV 'EmployeeNetId'. Skipping checkout.")
-        elif not bigfix_user_name:
-            print(f"BigFix 'User Name' column is empty for asset '{serial}'. Skipping user association (Scenario One only).")
+                print(f"BigFix username '{bigfix_user_name}' from asset {serial} not found in directory export. Skipping checkout.")
         else:
-            print(f"Asset ID for workflow is missing for {serial}. Skipping user association.")
+            if asset_id_for_workflow:
+                print(f"No BigFix username provided for asset {serial}. Skipping user association/checkout.")
+            # else: Asset creation failed, message already printed above.
 
+    print(f"\n--- Sync Summary ---")
+    print(f"Manufacturers Added: {manufacturers_added_count}")
+    print(f"Models Added: {models_added_count}")
+    print(f"Users Added: {users_added_count}")
+    print(f"Assets Added: {assets_added_count}")
+    print(f"BigFix Entries Skipped: {skipped_serial_count}")
+    print(f"Final Assets Skipped (creation/checkout issues): {assets_skipped_final_count}")
+    print(f"\nScript execution finished.")
 
-    print(f"\n--- Overall Summary ---")
-    print(f"Asset Import:")
-    print(f"  New Manufacturers Added: {manufacturers_added_count}")
-    print(f"  New Models Added: {models_added_count}")
-    print(f"  New Assets Added: {assets_added_count}")
-    print(f"  Old Assets Deleted (Repurposed): {assets_deleted_count}")
-    print(f"  Assets Skipped (Initial CSV Filter/Later Checks): {skipped_serial_count + assets_skipped_final_count}")
-    print(f"\nUser Import:")
-    print(f"  New Users Added: {users_added_count}")
-    print(f"  Users Skipped: {users_skipped_count}")
-
-
-def get_asset_details_from_snipeit_raw_notes(asset_id):
-    """Helper to get asset details for notes field specifically."""
-    url = f"{SNIPEIT_API_BASE_URL}/hardware/{asset_id}"
-    try:
-        response = requests.get(url, headers=HEADERS)
-        response.raise_for_status()
-        asset_data = response.json()
-        return asset_data.get('notes', '')
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching raw notes for asset ID {asset_id}: {e}")
-        return ''
-    finally:
-        time.sleep(REQUEST_DELAY_SECONDS)
-
-def update_bigfix_last_report_in_notes(current_notes, new_report_time):
-    """Updates or adds the BigFix Last Report line in the notes."""
-    report_line_prefix = "BigFix Last Report:"
-    new_report_line = f"{report_line_prefix} {new_report_time.strftime('%Y-%m-%d %H:%M:%S')}"
-    
-    lines = current_notes.split('\n')
-    updated_lines = []
-    found_and_updated = False
-
-    for line in lines:
-        if report_line_prefix in line:
-            updated_lines.append(new_report_line)
-            found_and_updated = True
-        else:
-            updated_lines.append(line)
-    
-    if not found_and_updated:
-        updated_lines.append(new_report_line) # Add it if not found
-    
-    return "\n".join(filter(None, updated_lines)) # Filter out empty lines
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
