@@ -2,6 +2,8 @@ import csv
 import requests
 import os
 import time
+import re # Import regex module
+from collections import Counter # Import Counter for counting occurrences
 from dotenv import load_dotenv
 from datetime import datetime
 
@@ -17,7 +19,7 @@ elif not SNIPEIT_USER_PASSWORD:
 else:
     print("SNIPEIT_API_TOKEN and SNIPEIT_USER_PASSWORD successfully loaded.")
 
-BIGFIX_CSV_FILE = 'test_devices.csv'
+BIGFIX_CSV_FILE = 'bigfix_export.csv'
 DIRECTORY_CSV_FILE = 'directory_export.csv'
 
 MODEL_COLUMN = 'Model'
@@ -26,7 +28,12 @@ CATEGORY_COLUMN = 'Device Type'
 SERIAL_COLUMN = 'Serial'
 COMPUTER_NAME_COLUMN = 'Computer Name'
 LAST_REPORT_TIME_COLUMN = 'Last Report Time'
-BIGFIX_USERNAME_COLUMN = 'User Name'
+BIGFIX_USERNAME_COLUMN = 'User Name' # Primary user source
+
+# New columns for fallback user lookup
+FIREFOX_USERS_COLUMN = 'Firefox Users'
+CHROME_USERS_COLUMN = 'Chrome Users'
+NYU_WIFI_USERS_COLUMN = 'nyu Wi-Fi Users'
 
 USER_EMPLOYEE_NET_ID_COLUMN = 'EmployeeNetId'
 USER_EMPLOYEE_ID_COLUMN = 'EmployeeID'
@@ -358,6 +365,7 @@ def update_asset_status(asset_id, status_id, notes=""):
     finally:
         time.sleep(REQUEST_DELAY_SECONDS)
 
+
 def parse_last_report_time(time_str):
     """
     Parses BigFix 'Last Report Time' string into a datetime object.
@@ -390,6 +398,111 @@ def update_bigfix_last_report_in_notes(current_notes, new_report_time):
         updated_lines.append(new_report_line)
     
     return '\n'.join(updated_lines).strip()
+
+def extract_netid(text):
+    """
+    Extracts a NetID from various string formats (username or part before '@' in email).
+    Converts to lowercase and removes '@nyu.edu' or other domains if present.
+    Handles formats like "tjb38", "todernst@gmail.com", "( Person 1, todernst@gmail.com )",
+    "( Work, tjb387@nyu.edu )", "( nyu, tjb387 )".
+    """
+    if not text:
+        return None
+
+    text = text.strip().lower()
+
+    # Regex to capture content inside parentheses, or the whole string if no parentheses
+    # and then extract the part before '@' or the whole part if no '@'
+    # This tries to be robust against various separators and formats.
+    match = re.search(r'(?:\(\s*[^,]+,\s*)?([a-zA-Z0-9._%+-]+)(?:@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})?(?:\s*\))?', text)
+    if match:
+        potential_netid = match.group(1).split('@')[0].strip()
+        return potential_netid if potential_netid else None
+    
+    # Fallback for simple cases that regex might miss, though the regex above is broad
+    if '@' in text:
+        potential_netid = text.split('@')[0].strip()
+        return potential_netid if potential_netid else None
+    
+    return text if text else None
+
+def find_best_netid(row, directory_data_for_user_lookup, snipeit_users):
+    """
+    Finds the best NetID from fallback columns based on occurrence count
+    and validation against directory and Snipe-IT users.
+    Returns the best NetID (string) or None if no suitable NetID is found.
+    """
+    netid_candidates = Counter()
+    
+    # Columns to check for NetIDs
+    columns_to_check = [FIREFOX_USERS_COLUMN, CHROME_USERS_COLUMN, NYU_WIFI_USERS_COLUMN]
+
+    for col in columns_to_check:
+        column_data = row.get(col, '')
+        if column_data:
+            # Split by comma and process each part
+            # Use a more robust split that handles commas inside parentheses if needed,
+            # but for simplicity, assuming top-level commas separate entries.
+            parts = [p.strip() for p in column_data.split(',')]
+            for part in parts:
+                netid = extract_netid(part)
+                if netid:
+                    netid_candidates[netid] += 1
+
+    if not netid_candidates:
+        return None
+
+    # Sort candidates by count (descending) and then alphabetically (ascending) for tie-breaking
+    sorted_candidates = sorted(netid_candidates.items(), key=lambda item: (-item[1], item[0]))
+
+    best_qualifying_netid = None
+    max_count_found = -1 
+    qualifying_netids_at_max_count = [] 
+
+    # Iterate through candidates, prioritizing by count
+    for netid, count in sorted_candidates:
+        # If we've already found qualifying netids at a higher count, and current count is lower, stop.
+        if max_count_found != -1 and count < max_count_found:
+            break
+
+        # Check against DIRECTORY_CSV_FILE
+        dir_match = None
+        for dir_row in directory_data_for_user_lookup:
+            if dir_row.get(USER_EMPLOYEE_NET_ID_COLUMN, '').strip().lower() == netid:
+                dir_match = dir_row
+                break
+        
+        if dir_match:
+            # Check if user exists in Snipe-IT
+            employee_id_from_dir = dir_match.get(USER_EMPLOYEE_ID_COLUMN, '').strip()
+            snipeit_user_exists = False
+            if employee_id_from_dir and employee_id_from_dir in snipeit_users:
+                snipeit_user_exists = True
+            else: # Also check by username (netid) if employee_id didn't match or was missing
+                for user_data in snipeit_users.values():
+                    if user_data.get('username') == netid: 
+                        snipeit_user_exists = True
+                        break
+
+            if snipeit_user_exists:
+                # This NetID qualifies
+                if count > max_count_found:
+                    max_count_found = count
+                    best_qualifying_netid = netid
+                    qualifying_netids_at_max_count = [netid] # Start new list for this higher count
+                elif count == max_count_found:
+                    qualifying_netids_at_max_count.append(netid) # Add to list for current max count
+
+    # Apply tie-breaking rule for the highest count found
+    if len(qualifying_netids_at_max_count) == 1:
+        return qualifying_netids_at_max_count[0]
+    elif len(qualifying_netids_at_max_count) > 1:
+        # If multiple NetIDs have the same highest count AND qualify, do not assign.
+        print(f"  Multiple NetIDs ({', '.join(qualifying_netids_at_max_count)}) tied with max count {max_count_found} and qualified. No assignment for this device.")
+        return None
+    
+    return None # No qualifying NetID found
+
 
 def main():
     global SNIPEIT_STATUS_NAMES_BY_ID
@@ -528,6 +641,9 @@ def main():
             reader = csv.DictReader(csvfile)
 
             required_cols = [MODEL_COLUMN, MANUFACTURER_COLUMN, CATEGORY_COLUMN, SERIAL_COLUMN, COMPUTER_NAME_COLUMN, LAST_REPORT_TIME_COLUMN, BIGFIX_USERNAME_COLUMN]
+            # Add new required columns for fallback
+            required_cols.extend([FIREFOX_USERS_COLUMN, CHROME_USERS_COLUMN, NYU_WIFI_USERS_COLUMN])
+
             missing_cols = [col for col in required_cols if col not in reader.fieldnames]
 
             if missing_cols:
@@ -826,124 +942,158 @@ def main():
                 assets_skipped_final_count += 1
                 continue # Skip to next asset if asset creation failed
 
-        # --- Scenario One: Checkout Logic Only ---
-        bigfix_user_name = row.get(BIGFIX_USERNAME_COLUMN, '').strip()
+        # --- User Lookup and Checkout Logic ---
+        
+        # Determine the user_name to use for assignment
+        user_name_for_assignment = None
+        snipeit_target_user_info = None
 
-        if asset_id_for_workflow and bigfix_user_name: # Only proceed if asset exists AND BigFix provides a user name
+        bigfix_primary_user_name = row.get(BIGFIX_USERNAME_COLUMN, '').strip()
+
+        # Attempt to find user using the primary "User Name" column first
+        if bigfix_primary_user_name:
+            found_user_in_directory_csv_primary = None
+            for dir_row in directory_data_for_user_lookup:
+                if dir_row.get(USER_EMPLOYEE_NET_ID_COLUMN, '').strip().lower() == bigfix_primary_user_name.lower():
+                    found_user_in_directory_csv_primary = dir_row
+                    break
+            
+            if found_user_in_directory_csv_primary:
+                target_employee_id_primary = found_user_in_directory_csv_primary.get(USER_EMPLOYEE_ID_COLUMN, '').strip()
+                if target_employee_id_primary and target_employee_id_primary in snipeit_users:
+                    snipeit_target_user_info = snipeit_users[target_employee_id_primary]
+                    user_name_for_assignment = bigfix_primary_user_name # Use this primary user
+                else:
+                    # Primary user found in directory but not in Snipe-IT (or missing employee ID), try fallback
+                    print(f"  Primary BigFix user '{bigfix_primary_user_name}' found in directory but not in Snipe-IT. Attempting fallback lookup.")
+            else:
+                print(f"  Primary BigFix user '{bigfix_primary_user_name}' not found in directory. Attempting fallback lookup.")
+
+        # If primary user not found or not in Snipe-IT, try fallback logic
+        if not snipeit_target_user_info:
+            print(f"  Initiating fallback user lookup for asset {serial}.")
+            best_fallback_netid = find_best_netid(row, directory_data_for_user_lookup, snipeit_users)
+            
+            if best_fallback_netid:
+                print(f"  Fallback lookup identified '{best_fallback_netid}' as the best candidate.")
+                user_name_for_assignment = best_fallback_netid # Use the fallback NetID
+                # Now, find the actual Snipe-IT user info for this best_fallback_netid
+                # This loop is necessary because snipeit_users is keyed by employee_id or username
+                found_in_snipeit_cache = False
+                for user_data in snipeit_users.values():
+                    # Check by employee_num (if available from directory) or by username
+                    if user_data.get('username') == user_name_for_assignment.lower():
+                        snipeit_target_user_info = user_data
+                        found_in_snipeit_cache = True
+                        break
+                
+                if not found_in_snipeit_cache:
+                    print(f"  Warning: Fallback NetID '{user_name_for_assignment}' found in directory but not in Snipe-IT cache after re-check. Skipping checkout.")
+                    continue # Skip this asset
+            else:
+                print(f"  No suitable user found after fallback lookup for asset {serial}. Skipping checkout.")
+                assets_skipped_final_count += 1 # Increment skipped count for this scenario
+                continue # Skip this asset if no user found
+
+        if asset_id_for_workflow and snipeit_target_user_info: # Proceed only if asset exists AND a target user is identified
+            snipeit_user_id = snipeit_target_user_info['id']
+            
             current_snipeit_status, current_snipeit_assigned_to_id = get_asset_details_from_snipeit(asset_id_for_workflow)
 
-            # Debugging prints as discussed
+            # Debugging prints
             print(f"\nDEBUG: Asset {serial} (ID: {asset_id_for_workflow}) Initial Snipe-IT State Check:")
             print(f"  Current Status ID: {current_snipeit_status} ('{SNIPEIT_STATUS_NAMES_BY_ID.get(current_snipeit_status, 'Unknown')}')")
             print(f"  Current Assigned To ID: {current_snipeit_assigned_to_id if current_snipeit_assigned_to_id else 'None'}")
+            print(f"  Target User ID for Checkout: {snipeit_user_id} (NetID: {user_name_for_assignment})")
             print(f"  Expected Checkin Status ID: {checkin_status_id} ('{DEFAULT_STATUS_LABEL}')")
             print(f"  Expected Checked Out Status ID: {checked_out_status_id} ('{CHECKED_OUT_STATUS_LABEL}')")
 
-            found_user_in_directory_csv = None
-            for dir_row in directory_data_for_user_lookup:
-                if dir_row.get(USER_EMPLOYEE_NET_ID_COLUMN, '').strip().lower() == bigfix_user_name.lower():
-                    found_user_in_directory_csv = dir_row
-                    break
-            
-            if found_user_in_directory_csv:
-                target_employee_id = found_user_in_directory_csv.get(USER_EMPLOYEE_ID_COLUMN, '').strip()
-                snipeit_target_user_info = None
-                
-                if target_employee_id in snipeit_users:
-                    snipeit_target_user_info = snipeit_users[target_employee_id]
-                else: 
-                    for user_details in snipeit_users.values():
-                        if user_details['username'] and user_details['username'] == bigfix_user_name.lower():
-                            snipeit_target_user_info = user_details
-                            break
-
-                if snipeit_target_user_info:
-                    snipeit_user_id = snipeit_target_user_info['id']
-
-                    if current_snipeit_assigned_to_id == snipeit_user_id and current_snipeit_status == checked_out_status_id:
-                        print(f"Asset ID {asset_id_for_workflow} (Serial: {serial}) is already checked out to the correct user ID {snipeit_user_id} and status {SNIPEIT_STATUS_NAMES_BY_ID.get(checked_out_status_id)}. Skipping checkout.")
-                    else:
-                        print(f"\n--- Workflow for Asset ID {asset_id_for_workflow} (Serial: {serial}) - Preparing for Checkout ---")
-                        print(f"  Current Snipe-IT State: Status ID {current_snipeit_status}, Assigned To: {current_snipeit_assigned_to_id}")
-
-                        # Step 1: Ensure asset status is 'Ready to Deploy' (checkin_status_id)
-                        # This is a prerequisite for a successful check-in/checkout.
-                        if current_snipeit_status != checkin_status_id:
-                            print(f"  Asset is NOT in '{DEFAULT_STATUS_LABEL}' state. Attempting to set status to '{DEFAULT_STATUS_LABEL}' ({checkin_status_id}).")
-                            status_update_notes = f"Automatic status update to '{DEFAULT_STATUS_LABEL}' before check-in/checkout workflow. Last BigFix Report: {bigfix_last_report_time.strftime('%Y-%m-%d %H:%M:%S')}"
-                            if update_asset_status(asset_id_for_workflow, checkin_status_id, notes=status_update_notes):
-                                print(f"  Successfully set asset ID {asset_id_for_workflow} status to '{DEFAULT_STATUS_LABEL}'.")
-                                # Re-fetch to confirm status change
-                                current_snipeit_status, current_snipeit_assigned_to_id = get_asset_details_from_snipeit(asset_id_for_workflow)
-                                if current_snipeit_status != checkin_status_id:
-                                    print(f"  ❌ Status update verification failed. Asset is still not in '{DEFAULT_STATUS_LABEL}' state after update attempt.")
-                                    print(f"     Actual: Status {current_snipeit_status} ('{SNIPEIT_STATUS_NAMES_BY_ID.get(current_snipeit_status, 'Unknown')}').")
-                                    print(f"  Skipping checkout for asset {serial} due to inconsistent state after status update.")
-                                    continue # Skip to next asset
-                            else:
-                                print(f"  Failed to set asset {serial} status to '{DEFAULT_STATUS_LABEL}'. Skipping checkout.")
-                                continue # Skip to next asset
-                        else:
-                            print(f"  Asset is already in '{DEFAULT_STATUS_LABEL}' state. Proceeding to check assignment.")
-
-                        # Step 2: Perform explicit check-in if asset is currently assigned.
-                        # The previous step ensures its status is 'Ready to Deploy' before this check-in.
-                        if current_snipeit_assigned_to_id is not None:
-                            print(f"  Asset is currently assigned to user ID {current_snipeit_assigned_to_id}. Attempting to check in asset.")
-                            
-                            checkin_notes = (
-                                f"Automatic check-in based on BigFix data before re-assignment. "
-                                f"Previous assignment: {current_snipeit_assigned_to_id if current_snipeit_assigned_to_id else 'None'}. "
-                                f"Last BigFix Report: {bigfix_last_report_time.strftime('%Y-%m-%d %H:%M:%S')}"
-                            )
-
-                            if checkin_asset(asset_id_for_workflow, checkin_status_id, notes=checkin_notes):
-                                print(f"  Successfully attempted check-in for asset ID {asset_id_for_workflow}.")
-                                # Re-fetch to confirm state after check-in
-                                current_snipeit_status, current_snipeit_assigned_to_id = get_asset_details_from_snipeit(asset_id_for_workflow)
-                                if current_snipeit_status == checkin_status_id and current_snipeit_assigned_to_id is None:
-                                    print(f"  ✅ Post-check-in state confirmed: Asset is now '{SNIPEIT_STATUS_NAMES_BY_ID.get(checkin_status_id)}' and unassigned.")
-                                else:
-                                    print(f"  ❌ Post-check-in state verification failed. Asset is not fully in '{SNIPEIT_STATUS_NAMES_BY_ID.get(checkin_status_id)}' state or is still assigned.")
-                                    print(f"     Actual: Status {current_snipeit_status} ('{SNIPEIT_STATUS_NAMES_BY_ID.get(current_snipeit_status, 'Unknown')}'), Assigned {current_snipeit_assigned_to_id}.")
-                                    print(f"  Skipping checkout for asset {serial} due to inconsistent state after check-in.")
-                                    continue # Skip to next asset if check-in didn't result in expected state
-                            else:
-                                print(f"  Failed to check in asset {serial}. Skipping checkout.")
-                                continue # Skip to next asset if check-in API call failed
-                        else:
-                            print(f"  Asset is already unassigned. Proceeding to checkout.")
-
-                        # Step 3: Perform the checkout (This part remains the same)
-                        print(f"  Attempting to check out asset ID {asset_id_for_workflow} to user ID {snipeit_user_id}.")
-                        checkout_notes = f"Automatically checked out based on BigFix 'User Name': {bigfix_user_name}. Last BigFix Report: {bigfix_last_report_time.strftime('%Y-%m-%d %H:%M:%S')}"
-                        if checkout_asset_to_user(asset_id_for_workflow, snipeit_user_id, checkout_notes):
-                            print(f"  Successfully initiated checkout for asset {asset_id_for_workflow}.")
-                            # Update local cache immediately
-                            snipeit_assets[serial_upper]['checked_out_to_id'] = snipeit_user_id
-                            # Re-fetch to confirm Snipe-IT's new status and assignment
-                            current_snipeit_status, current_snipeit_assigned_to_id = get_asset_details_from_snipeit(asset_id_for_workflow)
-                            if current_snipeit_status == checked_out_status_id and current_snipeit_assigned_to_id == snipeit_user_id:
-                                print(f"  ✅ Checkout confirmed: Asset is now {SNIPEIT_STATUS_NAMES_BY_ID.get(checked_out_status_id)} and assigned to {snipeit_user_id}.")
-                            else:
-                                print(f"  ⚠️ Checkout verification failed. Expected Status {SNIPEIT_STATUS_NAMES_BY_ID.get(checked_out_status_id)} (ID {checked_out_status_id}) and assigned to User ID {snipeit_user_id}.")
-                                print(f"     Actual: Status {SNIPEIT_STATUS_NAMES_BY_ID.get(current_snipeit_status)} (ID {current_snipeit_status}), Assigned To: {current_snipeit_assigned_to_id if current_snipeit_assigned_to_id else 'Nobody'}")
-                                print(f"     Attempting to force status update to '{CHECKED_OUT_STATUS_LABEL}'.")
-                                update_notes = f"Forced status update after BigFix-driven checkout. Last BigFix Report: {bigfix_last_report_time.strftime('%Y-%m-%d %H:%M:%S')}"
-                                if update_asset_status(asset_id_for_workflow, checked_out_status_id, update_notes):
-                                    print(f"  Successfully forced status to '{CHECKED_OUT_STATUS_LABEL}'.")
-                                else:
-                                    print(f"  Failed to force status to '{CHECKED_OUT_STATUS_LABEL}'. Manual intervention may be needed.")
-                        else:
-                            print(f"  Failed to check out asset {asset_id_for_workflow} to user {snipeit_user_id}.")
-                            snipeit_assets[serial_upper]['checked_out_to_id'] = current_snipeit_assigned_to_id
-                else:
-                    print(f"No matching Snipe-IT user found for BigFix username '{bigfix_user_name}'. Skipping checkout for asset {serial}.")
+            # Check if asset is already correctly checked out to this user
+            if current_snipeit_assigned_to_id == snipeit_user_id and current_snipeit_status == checked_out_status_id:
+                print(f"Asset ID {asset_id_for_workflow} (Serial: {serial}) is already checked out to the correct user ID {snipeit_user_id} and status {SNIPEIT_STATUS_NAMES_BY_ID.get(checked_out_status_id)}. Skipping checkout.")
             else:
-                print(f"BigFix username '{bigfix_user_name}' from asset {serial} not found in directory export. Skipping checkout.")
+                print(f"\n--- Workflow for Asset ID {asset_id_for_workflow} (Serial: {serial}) - Preparing for Checkout ---")
+                print(f"  Current Snipe-IT State: Status ID {current_snipeit_status}, Assigned To: {current_snipeit_assigned_to_id}")
+
+                # Step 1: Ensure asset status is 'Ready to Deploy' (checkin_status_id)
+                # This is a prerequisite for a successful check-in/checkout.
+                if current_snipeit_status != checkin_status_id:
+                    print(f"  Asset is NOT in '{DEFAULT_STATUS_LABEL}' state. Attempting to set status to '{DEFAULT_STATUS_LABEL}' ({checkin_status_id}).")
+                    status_update_notes = f"Automatic status update to '{DEFAULT_STATUS_LABEL}' before check-in/checkout workflow. Last BigFix Report: {bigfix_last_report_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                    if update_asset_status(asset_id_for_workflow, checkin_status_id, notes=status_update_notes):
+                        print(f"  Successfully set asset ID {asset_id_for_workflow} status to '{DEFAULT_STATUS_LABEL}'.")
+                        # Re-fetch to confirm status change
+                        current_snipeit_status, current_snipeit_assigned_to_id = get_asset_details_from_snipeit(asset_id_for_workflow)
+                        if current_snipeit_status != checkin_status_id:
+                            print(f"  ❌ Status update verification failed. Asset is still not in '{DEFAULT_STATUS_LABEL}' state after update attempt.")
+                            print(f"     Actual: Status {current_snipeit_status} ('{SNIPEIT_STATUS_NAMES_BY_ID.get(current_snipeit_status, 'Unknown')}').")
+                            print(f"  Skipping checkout for asset {serial} due to inconsistent state after status update.")
+                            assets_skipped_final_count += 1
+                            continue # Skip to next asset
+                    else:
+                        print(f"  Failed to set asset {serial} status to '{DEFAULT_STATUS_LABEL}'. Skipping checkout.")
+                        assets_skipped_final_count += 1
+                        continue # Skip to next asset
+                else:
+                    print(f"  Asset is already in '{DEFAULT_STATUS_LABEL}' state. Proceeding to check assignment.")
+
+                # Step 2: Perform explicit check-in if asset is currently assigned.
+                # The previous step ensures its status is 'Ready to Deploy' before this check-in.
+                if current_snipeit_assigned_to_id is not None:
+                    print(f"  Asset is currently assigned to user ID {current_snipeit_assigned_to_id}. Attempting to check in asset.")
+                    
+                    checkin_notes = (
+                        f"Automatic check-in based on BigFix data before re-assignment. "
+                        f"Previous assignment: {current_snipeit_assigned_to_id if current_snipeit_assigned_to_id else 'None'}. "
+                        f"Last BigFix Report: {bigfix_last_report_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+
+                    if checkin_asset(asset_id_for_workflow, checkin_status_id, notes=checkin_notes):
+                        print(f"  Successfully attempted check-in for asset ID {asset_id_for_workflow}.")
+                        # Re-fetch to confirm state after check-in
+                        current_snipeit_status, current_snipeit_assigned_to_id = get_asset_details_from_snipeit(asset_id_for_workflow)
+                        if current_snipeit_status == checkin_status_id and current_snipeit_assigned_to_id is None:
+                            print(f"  ✅ Post-check-in state confirmed: Asset is now '{SNIPEIT_STATUS_NAMES_BY_ID.get(checkin_status_id)}' and unassigned.")
+                        else:
+                            print(f"  ❌ Post-check-in state verification failed. Asset is not fully in '{SNIPEIT_STATUS_NAMES_BY_ID.get(checkin_status_id)}' state or is still assigned.")
+                            print(f"     Actual: Status {current_snipeit_status} ('{SNIPEIT_STATUS_NAMES_BY_ID.get(current_snipeit_status, 'Unknown')}'), Assigned {current_snipeit_assigned_to_id}.")
+                            print(f"  Skipping checkout for asset {serial} due to inconsistent state after check-in.")
+                            assets_skipped_final_count += 1
+                            continue # Skip to next asset if check-in didn't result in expected state
+                    else:
+                        print(f"  Failed to check in asset {serial}. Skipping checkout.")
+                        assets_skipped_final_count += 1
+                        continue # Skip to next asset if check-in API call failed
+                else:
+                    print(f"  Asset is already unassigned. Proceeding to checkout.")
+
+                # Step 3: Perform the checkout
+                print(f"  Attempting to check out asset ID {asset_id_for_workflow} to user ID {snipeit_user_id}.")
+                checkout_notes = f"Automatically checked out based on BigFix 'User Name': {user_name_for_assignment}. Last BigFix Report: {bigfix_last_report_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                if checkout_asset_to_user(asset_id_for_workflow, snipeit_user_id, checkout_notes):
+                    print(f"  Successfully initiated checkout for asset {asset_id_for_workflow}.")
+                    # Update local cache immediately
+                    snipeit_assets[serial_upper]['checked_out_to_id'] = snipeit_user_id
+                    # Re-fetch to confirm Snipe-IT's new status and assignment
+                    current_snipeit_status, current_snipeit_assigned_to_id = get_asset_details_from_snipeit(asset_id_for_workflow)
+                    if current_snipeit_status == checked_out_status_id and current_snipeit_assigned_to_id == snipeit_user_id:
+                        print(f"  ✅ Checkout confirmed: Asset is now {SNIPEIT_STATUS_NAMES_BY_ID.get(checked_out_status_id)} and assigned to {snipeit_user_id}.")
+                    else:
+                        print(f"  ⚠️ Checkout verification failed. Expected Status {SNIPEIT_STATUS_NAMES_BY_ID.get(checked_out_status_id)} (ID {checked_out_status_id}) and assigned to User ID {snipeit_user_id}.")
+                        print(f"     Actual: Status {SNIPEIT_STATUS_NAMES_BY_ID.get(current_snipeit_status)} (ID {current_snipeit_status}), Assigned To: {current_snipeit_assigned_to_id if current_snipeit_assigned_to_id else 'Nobody'}")
+                        print(f"     Attempting to force status update to '{CHECKED_OUT_STATUS_LABEL}'.")
+                        update_notes = f"Forced status update after BigFix-driven checkout. Last BigFix Report: {bigfix_last_report_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                        if update_asset_status(asset_id_for_workflow, checked_out_status_id, update_notes):
+                            print(f"  Successfully forced status to '{CHECKED_OUT_STATUS_LABEL}'.")
+                        else:
+                            print(f"  Failed to force status to '{CHECKED_OUT_STATUS_LABEL}'. Manual intervention may be needed.")
+                else:
+                    print(f"  Failed to check out asset {asset_id_for_workflow} to user {snipeit_user_id}.")
+                    snipeit_assets[serial_upper]['checked_out_to_id'] = current_snipeit_assigned_to_id
         else:
             if asset_id_for_workflow:
-                print(f"No BigFix username provided for asset {serial}. Skipping user association/checkout.")
+                print(f"No BigFix username or suitable fallback user found for asset {serial}. Skipping user association/checkout.")
+                assets_skipped_final_count += 1
             # else: Asset creation failed, message already printed above.
 
     print(f"\n--- Sync Summary ---")
@@ -951,8 +1101,8 @@ def main():
     print(f"Models Added: {models_added_count}")
     print(f"Users Added: {users_added_count}")
     print(f"Assets Added: {assets_added_count}")
-    print(f"BigFix Entries Skipped: {skipped_serial_count}")
-    print(f"Final Assets Skipped (creation/checkout issues): {assets_skipped_final_count}")
+    print(f"BigFix Entries Skipped (initial filter): {skipped_serial_count}")
+    print(f"Assets Skipped (creation/checkout issues or no user found): {assets_skipped_final_count}")
     print(f"\nScript execution finished.")
 
 if __name__ == '__main__':
