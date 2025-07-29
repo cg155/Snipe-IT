@@ -6,3 +6,4 @@ test_devices.csv
 directory_export.csv
 test_users.csv
 /logs
+multi_user_admins.csv

@@ -15,17 +15,9 @@ log_dir = 'logs'
 if not os.path.exists(log_dir):
     os.makedirs(log_dir)
 
-# --- MODIFICATION START ---
 # Define log file path with date only for daily overwrite
 log_filename = datetime.now().strftime('sync_log_%Y%m%d.txt')
 log_filepath = os.path.join(log_dir, log_filename)
-
-# --- Removed direct call to cleanup_old_logs here ---
-# --- It will now be called inside main() after loggers are initialized ---
-
-# Initialize loggers globally or ensure they are ready before any function that uses them
-# For this specific error, we'll ensure they are set up at the very start of main()
-# and functions like cleanup_old_logs will be called AFTER they are set up.
 
 file_logger = logging.getLogger('file_logger')
 console_logger = logging.getLogger('console_logger')
@@ -33,7 +25,7 @@ console_logger = logging.getLogger('console_logger')
 def cleanup_old_logs(log_directory, max_logs=30):
     all_log_files = sorted(glob.glob(os.path.join(log_directory, 'sync_log_*.txt')))
     
-    file_logger.debug(f"Current log files found: {len(all_log_files)}") # Now file_logger is defined
+    file_logger.debug(f"Current log files found: {len(all_log_files)}")
 
     if len(all_log_files) >= max_logs:
         num_to_delete = len(all_log_files) - max_logs + 1 # +1 to make space for the new log
@@ -45,8 +37,6 @@ def cleanup_old_logs(log_directory, max_logs=30):
             except OSError as e:
                 file_logger.error(f"Error deleting old log file {all_log_files[i]}: {e}")
 
-# --- MODIFICATION END ---
-
 
 load_dotenv()
 SNIPEIT_API_BASE_URL = os.environ.get('SNIPEIT_API_BASE_URL', '')
@@ -54,13 +44,11 @@ SNIPEIT_API_TOKEN = os.environ.get('SNIPEIT_API_TOKEN', '')
 SNIPEIT_USER_PASSWORD = os.environ.get('SNIPEIT_USER_PASSWORD', '')
 
 if not SNIPEIT_API_TOKEN:
-    # These initial warnings might still use print or a very basic logger if we want them BEFORE full setup
-    # For now, we'll assume main() sets up the loggers quickly enough.
-    # If the token is missing, the script will likely fail quickly anyway.
-    pass # This will be handled in main() after logger setup
+    pass 
 
-BIGFIX_CSV_FILE = 'test_devices.csv'
+BIGFIX_CSV_FILE = 'bigfix_export.csv'
 DIRECTORY_CSV_FILE = 'directory_export.csv'
+MULTI_USER_ADMINS_CSV_FILE = 'multi_user_admins.csv' # New CSV for Priority 4
 
 MODEL_COLUMN = 'Model'
 MANUFACTURER_COLUMN = 'Manufacturer'
@@ -89,7 +77,7 @@ CHECKED_OUT_STATUS_LABEL = 'Deployed'
 DEFAULT_LOCATION_NAME = 'Office'
 TARGET_COMPANY_NAME = 'NYU - Tandon School of Engineering'
 
-REQUEST_DELAY_SECONDS = 0.15
+REQUEST_DELAY_SECONDS = 0.2
 MAX_API_LIMIT_PER_REQUEST = 500
 
 SERIAL_SKIP_LIST = ["0123456789", "To be filled by O.E.M.", "System Serial Number"]
@@ -149,7 +137,7 @@ def get_asset_details_from_snipeit(asset_id):
         if asset_data and 'id' in asset_data:
             current_status_id = asset_data.get('status_label', {}).get('id')
             current_assigned_to_id = None
-            if asset_data.get('assigned_to') and asset_data['assigned_to']['type'] == 'user': # Corrected: used asset_data instead of asset
+            if asset_data.get('assigned_to') and asset_data['assigned_to']['type'] == 'user':
                 current_assigned_to_id = asset_data['assigned_to'].get('id')
             elif asset_data.get('assigned_to') and asset_data['assigned_to'].get('type') == 'location':
                 current_assigned_to_id = asset_data['assigned_to'].get('id')
@@ -511,8 +499,7 @@ def find_best_netid(row, directory_data_for_user_lookup, snipeit_users):
     qualifying_netids_at_max_count = [] 
 
     # Iterate through candidates, prioritizing by count
-    for netid, count in sorted_candidates: # Iterating over sorted_candidates directly
-        # If we've already found qualifying netids at a higher count, and current count is lower, stop.
+    for netid, count in sorted_candidates:
         if max_count_found != -1 and count < max_count_found:
             break
 
@@ -536,36 +523,31 @@ def find_best_netid(row, directory_data_for_user_lookup, snipeit_users):
                         break
 
             if snipeit_user_exists:
-                # This NetID qualifies
                 if count > max_count_found:
                     max_count_found = count
                     best_qualifying_netid = netid
-                    qualifying_netids_at_max_count = [netid] # Start new list for this higher count
+                    qualifying_netids_at_max_count = [netid] 
                 elif count == max_count_found:
-                    qualifying_netids_at_max_count.append(netid) # Add to list for current max count
+                    qualifying_netids_at_max_count.append(netid) 
 
-    # Apply tie-breaking rule for the highest count found
     if len(qualifying_netids_at_max_count) == 1:
         return qualifying_netids_at_max_count[0]
     elif len(qualifying_netids_at_max_count) > 1:
-        # If multiple NetIDs have the same highest count AND qualify, do not assign.
         file_logger.info(f"  Multiple NetIDs ({', '.join(qualifying_netids_at_max_count)}) tied with max count {max_count_found} and qualified. No assignment for this device.")
         return None
     
-    return None # No qualifying NetID found
+    return None 
 
 def main():
     global SNIPEIT_STATUS_NAMES_BY_ID
-    global file_logger, console_logger # Declare global to modify the ones defined above
+    global file_logger, console_logger 
 
     # --- Configure Loggers at the start of main() ---
-    # It's crucial to set filemode='w' to ensure overwrite for the daily log
     file_logger.setLevel(logging.DEBUG)
-    # Remove existing handlers to prevent duplicate logging if main is called multiple times or on reload
     if file_logger.handlers:
         for handler in file_logger.handlers[:]:
             file_logger.removeHandler(handler)
-    file_handler = logging.FileHandler(log_filepath, mode='w') # 'w' for overwrite
+    file_handler = logging.FileHandler(log_filepath, mode='w')
     file_handler.setLevel(logging.DEBUG)
     file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(file_formatter)
@@ -583,18 +565,15 @@ def main():
     console_logger.propagate = False
     # --- End Logger Configuration ---
 
-    # Now that file_logger is configured, we can call cleanup_old_logs
     cleanup_old_logs(log_dir, max_logs=30)
 
-    # Print a starting message to the console
-    console_logger.info(f"") # Add a blank line for spacing
+    console_logger.info(f"") 
     console_logger.info(f"=====================================================================")
     console_logger.info(f"                 Snipe-IT Sync Script Started!")
     console_logger.info(f"=====================================================================")
     console_logger.info(f"Detailed logs are being saved to: {log_filepath}")
-    console_logger.info(f"") # Add a blank line for spacing
+    console_logger.info(f"") 
 
-    # Check for API tokens after loggers are set up
     if not SNIPEIT_API_TOKEN:
         file_logger.warning("SNIPEIT_API_TOKEN environment variable not set. Please set it in your .env file.")
     elif not SNIPEIT_USER_PASSWORD:
@@ -612,11 +591,12 @@ def main():
     snipeit_assets = {}
     snipeit_users = {}
     directory_data_for_user_lookup = []
+    multi_user_admins_data = [] # New: Store data from multi_user_admins.csv
 
-    # New counters and list for Priority 3 reporting
     eng_format_devices_found = 0
     assigned_via_priority_3 = 0
-    eng_format_device_names = [] # List to store names of matching devices
+    assigned_via_priority_4 = 0 # New: Counter for Priority 4 assignments
+    eng_format_device_names = [] 
 
     file_logger.info("--- Collecting Existing Snipe-IT Data (Paginated) ---")
 
@@ -686,7 +666,7 @@ def main():
         notes = asset.get('notes', '')
         checked_out_to_id = None
         if asset.get('assigned_to') and asset['assigned_to']['type'] == 'user':
-            checked_out_to_id = asset['assigned_to']['id']
+            checked_out_to_id = asset['assigned_to'].get('id')
 
         if asset_tag and asset_id:
             last_report_time_from_notes = datetime.min
@@ -902,23 +882,18 @@ def main():
 
                 directory_data_for_user_lookup.append(row)
 
-                # Prioritize EmployeeID for Snipe-IT user lookup as it's typically unique and stable
-                # If EmployeeID already exists, we consider the user already processed/present.
                 if employee_id in snipeit_users:
                     file_logger.info(f"User with EmployeeID '{employee_id}' (NetID: {employee_net_id}) already exists in Snipe-IT. Skipping creation.")
                     users_skipped_count += 1
                     continue
                 
-                # Further checks for uniqueness if EmployeeID is not directly matched
                 is_duplicate_by_username = False
                 is_duplicate_by_email = False
                 for existing_user_data in snipeit_users.values():
-                    # Check by username if it exists and matches
                     if existing_user_data['username'] and existing_user_data['username'] == employee_net_id.lower():
                         is_duplicate_by_username = True
                         break
-                    # Check by email if it exists and matches
-                    if existing_user_data['email'] and existing_user_data['email'].lower() == email.lower(): # Added .lower() for email comparison
+                    if existing_user_data['email'] and existing_user_data['email'].lower() == email.lower():
                         is_duplicate_by_email = True
                         break
                 
@@ -949,7 +924,6 @@ def main():
                 if created_user_response:
                     users_added_count += 1
                     new_user_id = created_user_response['payload']['id']
-                    # Add to snipeit_users cache using employee_id as primary key
                     snipeit_users[employee_id] = {
                         'id': new_user_id,
                         'username': employee_net_id.lower(),
@@ -957,13 +931,40 @@ def main():
                         'first_name': first_name.lower(),
                         'last_name': last_name.lower(),
                     }
-                    # Also add by username for direct lookup later if employee_id isn't directly available
                     snipeit_users[employee_net_id.lower()] = snipeit_users[employee_id]
 
     except FileNotFoundError:
         file_logger.error(f"Error: Directory export CSV file '{DIRECTORY_CSV_FILE}' not found. Skipping user import.")
     except Exception as e:
         file_logger.exception(f"An error occurred while reading the directory CSV file: {e}")
+
+    # New: Read multi_user_admins.csv
+    file_logger.info(f"\n--- Processing Multi-User Admins CSV: {MULTI_USER_ADMINS_CSV_FILE} ---")
+    try:
+        with open(MULTI_USER_ADMINS_CSV_FILE, mode='r', encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+            admin_required_cols = ["Name Schema", "Admin", "netid"]
+            admin_missing_cols = [col for col in admin_required_cols if col not in reader.fieldnames]
+
+            if admin_missing_cols:
+                file_logger.error(f"Error: Missing required columns in '{MULTI_USER_ADMINS_CSV_FILE}': {', '.join(admin_missing_cols)}")
+                file_logger.error(f"Available columns in CSV: {', '.join(reader.fieldnames)}")
+                # Decide if to exit or continue without this data
+            else:
+                for row_num, row in enumerate(reader, start=2):
+                    name_schema = row.get("Name Schema", "").strip().lower()
+                    admin_netid = row.get("netid", "").strip().lower()
+                    if name_schema and admin_netid:
+                        multi_user_admins_data.append({'name_schema': name_schema, 'netid': admin_netid})
+                    else:
+                        file_logger.warning(f"Skipping row {row_num} in '{MULTI_USER_ADMINS_CSV_FILE}': Missing 'Name Schema' or 'netid'.")
+        file_logger.info(f"Loaded {len(multi_user_admins_data)} entries from '{MULTI_USER_ADMINS_CSV_FILE}'.")
+    except FileNotFoundError:
+        file_logger.warning(f"Warning: Multi-User Admins CSV file '{MULTI_USER_ADMINS_CSV_FILE}' not found. Priority 4 assignment will be skipped.")
+        multi_user_admins_data = [] # Ensure it's empty if file not found
+    except Exception as e:
+        file_logger.exception(f"An error occurred while reading the Multi-User Admins CSV file: {e}")
+        multi_user_admins_data = []
 
     file_logger.info(f"\n--- Populating Assets in Snipe-IT ---")
     assets_added_count = 0
@@ -988,13 +989,11 @@ def main():
         computer_name_from_csv = row.get(COMPUTER_NAME_COLUMN)
         computer_name_for_asset = computer_name_from_csv.strip() if computer_name_from_csv and computer_name_from_csv.strip() else serial
 
-        # --- Moved ENG- prefix counting here to apply to ALL relevant devices ---
         computer_name_lower = computer_name_for_asset.lower()
         if computer_name_lower.startswith('eng-'):
             eng_format_devices_found += 1
-            eng_format_device_names.append(computer_name_for_asset) # Store original case name
+            eng_format_device_names.append(computer_name_for_asset)
             file_logger.debug(f"  Computer name '{computer_name_for_asset}' matched broad 'ENG-' prefix. (Total {eng_format_devices_found})")
-        # --- End of moved ENG- prefix counting ---
 
         model_name = row.get(MODEL_COLUMN).strip()
         manufacturer_name = row.get(MANUFACTURER_COLUMN).strip()
@@ -1009,7 +1008,7 @@ def main():
         model_id = snipeit_models.get(model_lookup_key)
 
         if not manufacturer_id or not category_id or not model_id:
-            file_logger.warning(f"Skipping asset '{computer_name_for_asset}' (Serial: {serial}): Required Manufacturer ID, Category ID, or Model ID not found/created.")
+            file_logger.warning(f"Skipping asset '{computer_name_for_asset}' (Serial: {serial}): Required Manufacturer ID, Category ID, or Model ID not found/created. Skipping asset and user association.")
             assets_skipped_final_count += 1
             continue
 
@@ -1114,20 +1113,16 @@ def main():
             else:
                 file_logger.info(f"  Priority 2: No suitable user found after fallback lookup for asset {serial}. Moving to Priority 3.")
         
-        # Priority 3: Computer Name (ENG-*-*) - Now only handles assignment, counting is done above
+        # Priority 3: Computer Name (ENG-*-*)
         if not snipeit_target_user_info:
             file_logger.debug(f"  Initiating Priority 3 (Computer Name) lookup for asset {serial} with name '{computer_name_for_asset}'.")
             
-            # The *counting* for eng-format devices is now done earlier, outside this conditional block.
-            # This part specifically tries to assign a user based on the ENG- prefix.
             if computer_name_lower.startswith('eng-') and '-' in computer_name_lower[4:]:
-                # Example: "eng-netid-suffix"
                 parts = computer_name_lower.split('-')
                 if len(parts) >= 2 and parts[0] == 'eng':
-                    extracted_netid = parts[1] # The part immediately after "eng-"
+                    extracted_netid = parts[1]
                     file_logger.info(f"  Priority 3: Extracted potential NetID '{extracted_netid}' from Computer Name '{computer_name_for_asset}' for assignment attempt.")
 
-                    # Validate extracted NetID against directory and Snipe-IT
                     dir_match_third_priority = None
                     for dir_row in directory_data_for_user_lookup:
                         if dir_row.get(USER_EMPLOYEE_NET_ID_COLUMN, '').strip().lower() == extracted_netid:
@@ -1139,16 +1134,65 @@ def main():
                         if target_employee_id_third_priority and target_employee_id_third_priority in snipeit_users:
                             snipeit_target_user_info = snipeit_users[target_employee_id_third_priority]
                             user_name_for_assignment = extracted_netid
-                            assigned_via_priority_3 += 1 # This counter still specifically tracks P3 assignments
+                            assigned_via_priority_3 += 1 
                             file_logger.info(f"  User found via Priority 3 (Computer Name) and validated: '{user_name_for_assignment}'")
                         else:
-                            file_logger.info(f"  Priority 3: Computer Name NetID '{extracted_netid}' found in directory but not in Snipe-IT (Employee ID {target_employee_id_third_priority} not in cache). No assignment from Computer Name.")
+                            file_logger.info(f"  Priority 3: Computer Name NetID '{extracted_netid}' found in directory but not in Snipe-IT (Employee ID {target_employee_id_third_priority} not in cache). Moving to Priority 4.")
                     else:
-                        file_logger.info(f"  Priority 3: Computer Name NetID '{extracted_netid}' not found in directory. No assignment from Computer Name.")
+                        file_logger.info(f"  Priority 3: Computer Name NetID '{extracted_netid}' not found in directory. Moving to Priority 4.")
                 else:
-                    file_logger.debug(f"  Priority 3: Computer Name '{computer_name_for_asset}' does not have a valid 'ENG-NetID' structure for extraction using split logic. No assignment from Computer Name.")
+                    file_logger.debug(f"  Priority 3: Computer Name '{computer_name_for_asset}' does not have a valid 'ENG-NetID' structure for extraction using split logic. Moving to Priority 4.")
             else:
-                file_logger.debug(f"  Priority 3: Computer Name '{computer_name_for_asset}' does not match 'ENG-*-*' format for NetID extraction. No assignment from Computer Name.")
+                file_logger.debug(f"  Priority 3: Computer Name '{computer_name_for_asset}' does not match 'ENG-*-*' format for NetID extraction. Moving to Priority 4.")
+
+        # Priority 4: multi_user_admins.csv lookup (NEW)
+        if not snipeit_target_user_info and multi_user_admins_data:
+            file_logger.debug(f"  Initiating Priority 4 (Multi-User Admins) lookup for asset {serial} with name '{computer_name_for_asset}'.")
+            
+            found_p4_match = False
+            for admin_entry in multi_user_admins_data:
+                name_schema = admin_entry['name_schema']
+                admin_netid = admin_entry['netid']
+                
+                if computer_name_lower.startswith(name_schema):
+                    file_logger.info(f"  Priority 4: Computer Name '{computer_name_for_asset}' matches schema '{name_schema}'. Checking for admin '{admin_netid}'.")
+                    
+                    # Check if the admin_netid exists in the directory data
+                    dir_match_p4 = None
+                    for dir_row in directory_data_for_user_lookup:
+                        if dir_row.get(USER_EMPLOYEE_NET_ID_COLUMN, '').strip().lower() == admin_netid:
+                            dir_match_p4 = dir_row
+                            break
+                    
+                    if dir_match_p4:
+                        # Check if the user (by employee ID or username) exists in Snipe-IT
+                        employee_id_from_dir_p4 = dir_match_p4.get(USER_EMPLOYEE_ID_COLUMN, '').strip()
+                        snipeit_user_exists_p4 = False
+                        
+                        if employee_id_from_dir_p4 and employee_id_from_dir_p4 in snipeit_users:
+                            snipeit_target_user_info = snipeit_users[employee_id_from_dir_p4]
+                            user_name_for_assignment = admin_netid
+                            snipeit_user_exists_p4 = True
+                        else: # Fallback to username if EmployeeID didn't match or was missing
+                            for user_data in snipeit_users.values():
+                                if user_data.get('username') == admin_netid: 
+                                    snipeit_target_user_info = user_data
+                                    user_name_for_assignment = admin_netid
+                                    snipeit_user_exists_p4 = True
+                                    break
+                        
+                        if snipeit_user_exists_p4:
+                            assigned_via_priority_4 += 1
+                            file_logger.info(f"  User found via Priority 4 (Multi-User Admin) and validated: '{user_name_for_assignment}'. Assigning device.")
+                            found_p4_match = True
+                            break # Found a match and assigned, stop checking other schemas for this device
+                        else:
+                            file_logger.info(f"  Priority 4: Admin NetID '{admin_netid}' found in directory but not in Snipe-IT. Skipping assignment for this schema.")
+                    else:
+                        file_logger.info(f"  Priority 4: Admin NetID '{admin_netid}' from schema '{name_schema}' not found in directory. Skipping assignment for this schema.")
+            
+            if not found_p4_match:
+                file_logger.info(f"  Priority 4: No suitable Multi-User Admin schema match found for asset {serial}.")
 
         if not snipeit_target_user_info:
             file_logger.info(f"  No suitable user found after all lookup priorities for asset {serial}. Skipping checkout.")
@@ -1244,7 +1288,6 @@ def main():
                 file_logger.info(f"No BigFix username or suitable fallback user found for asset {serial}. Skipping user association/checkout.")
                 assets_skipped_final_count += 1
 
-    # --- Use console_logger for the summary output, file_logger for detailed ENG- list ---
     console_logger.info(f"\n--- Sync Summary ---")
     console_logger.info(f"Manufacturers Added: {manufacturers_added_count}")
     console_logger.info(f"Models Added: {models_added_count}")
@@ -1253,9 +1296,9 @@ def main():
     console_logger.info(f"BigFix Entries Skipped (initial filter): {skipped_serial_count}")
     console_logger.info(f"Devices Matching 'ENG-' Prefix (Total Count): {eng_format_devices_found}")
     console_logger.info(f"Devices Assigned via Priority 3: {assigned_via_priority_3}")
+    console_logger.info(f"Devices Assigned via Priority 4: {assigned_via_priority_4}") # New summary line
     console_logger.info(f"Assets Skipped (creation/checkout issues or no user found): {assets_skipped_final_count}")
 
-    # Only log the list of matching device names to the file, not the console
     if eng_format_device_names:
         file_logger.info(f"Names of devices matching 'ENG-' prefix: {', '.join(eng_format_device_names)}")
     else:
