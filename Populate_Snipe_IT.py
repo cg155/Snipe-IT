@@ -23,6 +23,9 @@ file_logger = logging.getLogger('file_logger')
 console_logger = logging.getLogger('console_logger')
 
 def cleanup_old_logs(log_directory, max_logs=30):
+    """
+    Cleans up old log files in the specified directory, keeping only the most recent 'max_logs' files.
+    """
     all_log_files = sorted(glob.glob(os.path.join(log_directory, 'sync_log_*.txt')))
     
     file_logger.debug(f"Current log files found: {len(all_log_files)}")
@@ -49,6 +52,8 @@ if not SNIPEIT_API_TOKEN:
 BIGFIX_CSV_FILE = 'bigfix_export.csv'
 DIRECTORY_CSV_FILE = 'directory_export.csv'
 MULTI_USER_ADMINS_CSV_FILE = 'multi_user_admins.csv' # New CSV for Priority 4
+
+# Removed: USER_ADDITION_LOG_CSV constant
 
 MODEL_COLUMN = 'Model'
 MANUFACTURER_COLUMN = 'Manufacturer'
@@ -253,36 +258,50 @@ def delete_snipeit_asset(asset_id):
         time.sleep(REQUEST_DELAY_SECONDS)
 
 def create_snipeit_user(user_data):
-    """Creates a new user in Snipe-IT."""
+    """
+    Creates a new user in Snipe-IT.
+    Returns the API response JSON on success, or a structured error dictionary on failure.
+    """
     url = f"{SNIPEIT_API_BASE_URL}/users"
     response = None
     try:
         response = requests.post(url, headers=HEADERS, json=user_data)
         response.raise_for_status()
         file_logger.info(f"Successfully created user: {user_data.get('username', 'N/A')} (HTTP Status: {response.status_code})")
-        return response.json()
+        return {'status': 'success', 'payload': response.json().get('payload')}
     except requests.exceptions.RequestException as e:
         status_code = response.status_code if response is not None else 'N/A'
+        response_json = {}
         if response is not None and response.json():
-            response_json = response.json()
-            if 'messages' in response_json:
-                if 'username' in response_json['messages'] and 'already been taken' in response_json['messages']['username'][0]:
-                    file_logger.info(f"User with username '{user_data.get('username')}' already exists. Skipping creation (HTTP Status: {status_code}).")
-                    return None
-                if 'employee_num' in response_json['messages'] and 'already been taken' in response_json['messages']['employee_num'][0]:
-                    file_logger.info(f"User with employee number '{user_data.get('employee_num')}' already exists. Skipping creation (HTTP Status: {status_code}).")
-                    return None
-                if 'email' in response_json['messages'] and 'already been taken' in response_json['messages']['email'][0]:
-                    file_logger.info(f"User with email '{user_data.get('email')}' already exists (different EmployeeID perhaps). Skipping creation (HTTP Status: {status_code}).")
-                    return None
-                if 'password' in response_json['messages']:
-                    file_logger.error(f"Password validation error for user '{user_data.get('username')}': {response_json['messages']['password']} (HTTP Status: {status_code}).")
-                    return None
-            file_logger.error(f"Error creating user {user_data.get('username', 'N/A')}: {e} (HTTP Status: {status_code})")
-            file_logger.error(f"Snipe-IT API response: {response_json}")
-        else:
-            file_logger.error(f"Error creating user {user_data.get('username', 'N/A')}: {e} (No JSON response body / HTTP Status: {status_code})")
-        return None
+            try:
+                response_json = response.json()
+            except ValueError: # Not a JSON response
+                response_json = {'messages': f"Non-JSON API response: {response.text}"}
+        
+        # Capture specific duplicate messages for structured logging
+        duplicate_fields = []
+        if 'messages' in response_json:
+            if 'username' in response_json['messages'] and 'already been taken' in response_json['messages']['username'][0]:
+                duplicate_fields.append('username')
+            if 'employee_num' in response_json['messages'] and 'already been taken' in response_json['messages']['employee_num'][0]:
+                duplicate_fields.append('employee_num')
+            if 'email' in response_json['messages'] and 'already been taken' in response_json['messages']['email'][0]:
+                duplicate_fields.append('email')
+        
+        if duplicate_fields:
+            # This case is largely handled by pre-checks now, but remains as a robust fallback
+            file_logger.info(f"User with username '{user_data.get('username')}' (Employee ID: {user_data.get('employee_num')}, Email: {user_data.get('email')}) already exists based on API fields: {', '.join(duplicate_fields)}. Skipping creation (HTTP Status: {status_code}).")
+            return {'status': 'error', 'message': 'Duplicate user detected by API', 'duplicate_fields': duplicate_fields, 'http_status': status_code}
+        
+        if 'messages' in response_json and 'password' in response_json['messages']:
+            file_logger.error(f"Password validation error for user '{user_data.get('username')}': {response_json['messages']['password']} (HTTP Status: {status_code}).")
+            return {'status': 'error', 'message': f"Password validation error: {response_json['messages']['password'][0]}", 'http_status': status_code}
+        
+        # General API error
+        error_message = response_json.get('messages', str(e))
+        file_logger.error(f"Error creating user {user_data.get('username', 'N/A')}: {e} (HTTP Status: {status_code})")
+        file_logger.error(f"Snipe-IT API response: {response_json}")
+        return {'status': 'error', 'message': f"API Error: {error_message}", 'http_status': status_code}
     finally:
         time.sleep(REQUEST_DELAY_SECONDS)
 
@@ -466,7 +485,6 @@ def extract_netid(text):
     
     return None # If no suitable NetID found after all attempts
 
-
 def find_best_netid(row, directory_data_for_user_lookup, snipeit_users):
     """
     Finds the best NetID from fallback columns based on occurrence count
@@ -511,16 +529,13 @@ def find_best_netid(row, directory_data_for_user_lookup, snipeit_users):
                 break
         
         if dir_match:
-            # Check if user exists in Snipe-IT
+            # Check if user exists in Snipe-IT (checking both by employee_num and username keys)
             employee_id_from_dir = dir_match.get(USER_EMPLOYEE_ID_COLUMN, '').strip()
             snipeit_user_exists = False
             if employee_id_from_dir and employee_id_from_dir in snipeit_users:
                 snipeit_user_exists = True
-            else: # Also check by username (netid) if employee_id didn't match or was missing
-                for user_data in snipeit_users.values():
-                    if user_data.get('username') == netid: 
-                        snipeit_user_exists = True
-                        break
+            elif netid in snipeit_users: # Check by username (netid) if employee_id didn't match or was missing
+                snipeit_user_exists = True
 
             if snipeit_user_exists:
                 if count > max_count_found:
@@ -537,6 +552,161 @@ def find_best_netid(row, directory_data_for_user_lookup, snipeit_users):
         return None
     
     return None 
+
+def sync_directory_users_to_snipeit(directory_data_for_user_lookup, snipeit_users): # Removed user_addition_results parameter
+    """
+    Reads the directory export CSV, checks for user existence in Snipe-IT,
+    and attempts to create new users if they don't exist.
+    Logs outcomes to the main log file.
+    """
+    users_added_count = 0
+    users_skipped_count = 0
+
+    file_logger.info(f"\n--- Processing Directory Export CSV: {DIRECTORY_CSV_FILE} for Users ---")
+    try:
+        # Changed encoding to 'latin-1' to handle potential character issues
+        with open(DIRECTORY_CSV_FILE, mode='r', encoding='latin-1') as csvfile:
+            reader = csv.DictReader(csvfile)
+
+            user_required_cols = [
+                USER_EMPLOYEE_NET_ID_COLUMN,
+                USER_EMPLOYEE_ID_COLUMN,
+                USER_FIRST_NAME_COLUMN,
+                USER_LAST_NAME_COLUMN,
+                USER_EMAIL_COLUMN
+            ]
+            user_missing_cols = [col for col in user_required_cols if col not in reader.fieldnames]
+
+            if user_missing_cols:
+                reason = f"Missing required user columns in '{DIRECTORY_CSV_FILE}': {', '.join(user_missing_cols)}. Available: {', '.join(reader.fieldnames)}"
+                file_logger.error(f"Error: {reason}")
+                # No longer appending to user_addition_results
+                return users_added_count, users_skipped_count # Exit early if critical CSV error
+
+            for row_num, row in enumerate(reader, start=2):
+                employee_id = row.get(USER_EMPLOYEE_ID_COLUMN)
+                employee_net_id = row.get(USER_EMPLOYEE_NET_ID_COLUMN)
+                first_name = row.get(USER_FIRST_NAME_COLUMN)
+                last_name = row.get(USER_LAST_NAME_COLUMN)
+                email = row.get(USER_EMAIL_COLUMN)
+
+                # Removed: user_add_result dictionary initialization
+
+                # --- Basic validation for user data ---
+                if not all([employee_id, employee_net_id, first_name, last_name, email]):
+                    missing_fields = []
+                    if not employee_id: missing_fields.append('EmployeeID')
+                    if not employee_net_id: missing_fields.append('EmployeeNetId')
+                    if not first_name: missing_fields.append('FirstName')
+                    if not last_name: missing_fields.append('LastName')
+                    if not email: missing_fields.append('EmployeeEmailAddress')
+
+                    reason = f"Missing required user data: {', '.join(missing_fields)}"
+                    file_logger.warning(f"Skipping user in row {row_num}: {reason} for '{employee_net_id}' (ID: {employee_id}).")
+                    users_skipped_count += 1
+                    # No longer appending to user_addition_results
+                    continue
+                
+                # Strip whitespace from relevant fields
+                employee_id = employee_id.strip()
+                employee_net_id = employee_net_id.strip()
+                first_name = first_name.strip()
+                last_name = last_name.strip()
+                email = email.strip()
+
+                directory_data_for_user_lookup.append(row) # Add to lookup list for asset assignment later
+
+                duplicate_found = False
+                duplicate_reason = ""
+                duplicate_user_info = {}
+                matched_fields = []
+
+                # --- Duplicate Check Logic ---
+                # Check 1: By Employee ID
+                if employee_id in snipeit_users:
+                    duplicate_user_info = snipeit_users[employee_id]
+                    duplicate_reason = f"User with EmployeeID '{employee_id}' already exists in Snipe-IT."
+                    matched_fields.append('EmployeeID')
+                    duplicate_found = True
+                
+                # Check 2: By Username (NetID) - only if not already found by Employee ID
+                if not duplicate_found:
+                    # Iterate through values to find match regardless of key type (employee_num or username)
+                    for existing_user_key, existing_user_data in snipeit_users.items():
+                        if existing_user_data.get('username') and existing_user_data['username'].lower() == employee_net_id.lower():
+                            duplicate_user_info = existing_user_data
+                            duplicate_reason = f"User with username '{employee_net_id}' already exists in Snipe-IT."
+                            matched_fields.append('Username')
+                            duplicate_found = True
+                            break # Found a duplicate by username, no need to check others
+
+                # Check 3: By Email - only if not already found by Employee ID or Username
+                if not duplicate_found:
+                    for existing_user_key, existing_user_data in snipeit_users.items():
+                        if existing_user_data.get('email') and existing_user_data['email'].lower() == email.lower():
+                            duplicate_user_info = existing_user_data
+                            duplicate_reason = f"User with email '{email}' already exists in Snipe-IT."
+                            matched_fields.append('Email')
+                            duplicate_found = True
+                            break # Found a duplicate by email, no need to check others
+
+                if duplicate_found:
+                    file_logger.info(f"{duplicate_reason} (Attempted NetID: {employee_net_id}, EmployeeID: {employee_id}). Matched fields: {', '.join(matched_fields)}. Skipping creation.")
+                    file_logger.info(f"  Attempted: NetID='{employee_net_id}', EmployeeID='{employee_id}', Email='{email}'")
+                    file_logger.info(f"  Existing: NetID='{duplicate_user_info.get('username', 'N/A')}', EmployeeID='{duplicate_user_info.get('employee_num', 'N/A')}', Email='{duplicate_user_info.get('email', 'N/A')}'")
+                    users_skipped_count += 1
+                    # No longer appending to user_addition_results
+                    continue
+
+                # If no duplicates found by any criteria, proceed to create user
+                user_payload = {
+                    'first_name': first_name,
+                    'last_name': last_name,
+                    'username': employee_net_id,
+                    'employee_num': employee_id,
+                    'email': email,
+                    'password': SNIPEIT_USER_PASSWORD,
+                    'password_confirmation': SNIPEIT_USER_PASSWORD,
+                    'activated': True,
+                    'can_login': False,
+                    'ldap_import': True
+                }
+                
+                file_logger.debug(f"DEBUG: Attempting to create user: {employee_net_id} (ID: {employee_id})")
+                created_user_response = create_snipeit_user(user_payload)
+                
+                if created_user_response and created_user_response.get('status') == 'success':
+                    users_added_count += 1
+                    new_user_id = created_user_response['payload']['id']
+                    # Add newly created user to our local cache for immediate de-duplication within the same run
+                    # Store by both employee_id and username (lowercase) for robust lookup
+                    snipeit_users[employee_id] = {
+                        'id': new_user_id,
+                        'username': employee_net_id.lower(),
+                        'email': email.lower(),
+                        'first_name': first_name.lower(),
+                        'last_name': last_name.lower(),
+                        'employee_num': employee_id # Store the employee_num for easier lookup later
+                    }
+                    if employee_id.lower() != employee_net_id.lower(): # Avoid redundant key if employee_id and netid are the same
+                        snipeit_users[employee_net_id.lower()] = snipeit_users[employee_id]
+
+                    # No longer appending to user_addition_results
+                else:
+                    users_skipped_count += 1
+                    reason = created_user_response.get('message', 'Unknown API error') if created_user_response else 'Unknown error during API call or no response'
+                    file_logger.error(f"Failed to create user {employee_net_id} (ID: {employee_id}): {reason}")
+                    # No longer appending to user_addition_results
+
+    except FileNotFoundError:
+        file_logger.error(f"Error: Directory export CSV file '{DIRECTORY_CSV_FILE}' not found. Skipping user import.")
+        # No longer appending to user_addition_results
+    except Exception as e:
+        file_logger.exception(f"An error occurred while reading the directory CSV file: {e}")
+        # No longer appending to user_addition_results
+    
+    return users_added_count, users_skipped_count
+
 
 def main():
     global SNIPEIT_STATUS_NAMES_BY_ID
@@ -567,6 +737,9 @@ def main():
 
     cleanup_old_logs(log_dir, max_logs=30)
 
+    # Removed: Clean up old user addition log CSVs logic
+    # Removed: console_logger.info(f"User addition results will be saved to: {USER_ADDITION_LOG_CSV}")
+
     console_logger.info(f"") 
     console_logger.info(f"=====================================================================")
     console_logger.info(f"                 Snipe-IT Sync Script Started!")
@@ -589,9 +762,9 @@ def main():
     snipeit_locations = {}
     snipeit_companies = {}
     snipeit_assets = {}
-    snipeit_users = {}
-    directory_data_for_user_lookup = []
-    multi_user_admins_data = [] # New: Store data from multi_user_admins.csv
+    snipeit_users = {} # Dictionary to store existing users
+    directory_data_for_user_lookup = [] # List to store directory data for user lookup during asset assignment
+    # Removed: user_addition_results = [] # New: List to store data for user addition CSV
 
     eng_format_devices_found = 0
     assigned_via_priority_3 = 0
@@ -696,29 +869,37 @@ def main():
         first_name = user.get('first_name', '') or ''
         last_name = user.get('last_name', '') or ''
 
+        # Store users by employee_num if available, and also by username for robust lookup
+        user_data_for_cache = {
+            'id': user_id,
+            'username': (username.strip().lower() if username else None),
+            'email': email.strip().lower(),
+            'first_name': first_name.strip().lower(),
+            'last_name': last_name.lower(),
+            'employee_num': employee_num.strip() if employee_num else None # Ensure employee_num is always in the cached data
+        }
+
         if employee_num:
-            snipeit_users[employee_num.strip()] = {
-                'id': user_id,
-                'username': (username.strip().lower() if username else None),
-                'email': email.strip().lower(),
-                'first_name': first_name.strip().lower(),
-                'last_name': last_name.lower(),
-            }
-        elif username:
-             snipeit_users[username.strip().lower()] = {
-                'id': user_id,
-                'username': username.strip().lower(),
-                'email': email.strip().lower(),
-                'first_name': first_name.strip().lower(),
-                'last_name': last_name.lower(),
-            }
+            snipeit_users[employee_num.strip()] = user_data_for_cache
+        if username: # Ensure username is also a lookup key
+            snipeit_users[username.strip().lower()] = user_data_for_cache
     file_logger.info(f"Total {len(snipeit_users)} existing users collected from Snipe-IT.")
+
+    # --- Phase 1: Synchronize Users from Directory Export CSV ---
+    users_added_this_run, users_skipped_this_run = sync_directory_users_to_snipeit(
+        directory_data_for_user_lookup, snipeit_users
+    )
+    # Update main counters
+    users_added_count = users_added_this_run
+    users_skipped_count = users_skipped_this_run
+
 
     file_logger.info(f"\n--- Processing BigFix CSV: {BIGFIX_CSV_FILE} for Assets ---")
     bigfix_data = {}
     skipped_serial_count = 0
     try:
-        with open(BIGFIX_CSV_FILE, mode='r', encoding='utf-8') as csvfile:
+        # Changed encoding to 'latin-1' to handle potential character issues
+        with open(BIGFIX_CSV_FILE, mode='r', encoding='latin-1') as csvfile:
             reader = csv.DictReader(csvfile)
 
             required_cols = [MODEL_COLUMN, MANUFACTURER_COLUMN, CATEGORY_COLUMN, SERIAL_COLUMN, COMPUTER_NAME_COLUMN, LAST_REPORT_TIME_COLUMN, BIGFIX_USERNAME_COLUMN]
@@ -840,108 +1021,11 @@ def main():
 
     file_logger.info(f"Successfully added {models_added_count} new models to Snipe-IT.")
 
-    file_logger.info(f"\n--- Processing Directory Export CSV: {DIRECTORY_CSV_FILE} for Users ---")
-    users_added_count = 0
-    users_skipped_count = 0
-
-    try:
-        with open(DIRECTORY_CSV_FILE, mode='r', encoding='utf-8') as csvfile:
-            reader = csv.DictReader(csvfile)
-
-            user_required_cols = [
-                USER_EMPLOYEE_NET_ID_COLUMN,
-                USER_EMPLOYEE_ID_COLUMN,
-                USER_FIRST_NAME_COLUMN,
-                USER_LAST_NAME_COLUMN,
-                USER_EMAIL_COLUMN
-            ]
-            user_missing_cols = [col for col in user_required_cols if col not in reader.fieldnames]
-
-            if user_missing_cols:
-                file_logger.error(f"Error: Missing required user columns in '{DIRECTORY_CSV_FILE}': {', '.join(user_missing_cols)}")
-                file_logger.error(f"Available columns in CSV: {', '.join(reader.fieldnames)}")
-                return
-
-            for row_num, row in enumerate(reader, start=2):
-                employee_id = row.get(USER_EMPLOYEE_ID_COLUMN)
-                employee_net_id = row.get(USER_EMPLOYEE_NET_ID_COLUMN)
-                first_name = row.get(USER_FIRST_NAME_COLUMN)
-                last_name = row.get(USER_LAST_NAME_COLUMN)
-                email = row.get(USER_EMAIL_COLUMN)
-
-                if not all([employee_id, employee_net_id, first_name, last_name, email]):
-                    file_logger.warning(f"Skipping user in row {row_num}: Missing required user data (EmployeeID, EmployeeNetId, FirstName, LastName, EmployeeEmailAddress).")
-                    users_skipped_count += 1
-                    continue
-                
-                employee_id = employee_id.strip()
-                employee_net_id = employee_net_id.strip()
-                first_name = first_name.strip()
-                last_name = last_name.strip()
-                email = email.strip()
-
-                directory_data_for_user_lookup.append(row)
-
-                if employee_id in snipeit_users:
-                    file_logger.info(f"User with EmployeeID '{employee_id}' (NetID: {employee_net_id}) already exists in Snipe-IT. Skipping creation.")
-                    users_skipped_count += 1
-                    continue
-                
-                is_duplicate_by_username = False
-                is_duplicate_by_email = False
-                for existing_user_data in snipeit_users.values():
-                    if existing_user_data['username'] and existing_user_data['username'] == employee_net_id.lower():
-                        is_duplicate_by_username = True
-                        break
-                    if existing_user_data['email'] and existing_user_data['email'].lower() == email.lower():
-                        is_duplicate_by_email = True
-                        break
-                
-                if is_duplicate_by_username:
-                    file_logger.info(f"User with username '{employee_net_id}' already exists (different EmployeeID perhaps). Skipping creation.")
-                    users_skipped_count += 1
-                    continue
-                if is_duplicate_by_email:
-                    file_logger.info(f"User with email '{email}' already exists (different EmployeeID perhaps). Skipping creation.")
-                    users_skipped_count += 1
-                    continue
-
-                user_payload = {
-                    'first_name': first_name,
-                    'last_name': last_name,
-                    'username': employee_net_id,
-                    'employee_num': employee_id,
-                    'email': email,
-                    'password': SNIPEIT_USER_PASSWORD,
-                    'password_confirmation': SNIPEIT_USER_PASSWORD,
-                    'activated': True,
-                    'can_login': False,
-                    'ldap_import': True
-                }
-                
-                file_logger.debug(f"DEBUG: Attempting to create user: {employee_net_id} (ID: {employee_id})")
-                created_user_response = create_snipeit_user(user_payload)
-                if created_user_response:
-                    users_added_count += 1
-                    new_user_id = created_user_response['payload']['id']
-                    snipeit_users[employee_id] = {
-                        'id': new_user_id,
-                        'username': employee_net_id.lower(),
-                        'email': email.lower(),
-                        'first_name': first_name.lower(),
-                        'last_name': last_name.lower(),
-                    }
-                    snipeit_users[employee_net_id.lower()] = snipeit_users[employee_id]
-
-    except FileNotFoundError:
-        file_logger.error(f"Error: Directory export CSV file '{DIRECTORY_CSV_FILE}' not found. Skipping user import.")
-    except Exception as e:
-        file_logger.exception(f"An error occurred while reading the directory CSV file: {e}")
-
     # New: Read multi_user_admins.csv
     file_logger.info(f"\n--- Processing Multi-User Admins CSV: {MULTI_USER_ADMINS_CSV_FILE} ---")
     try:
-        with open(MULTI_USER_ADMINS_CSV_FILE, mode='r', encoding='utf-8') as csvfile:
+        # Changed encoding to 'latin-1' to handle potential character issues
+        with open(MULTI_USER_ADMINS_CSV_FILE, mode='r', encoding='latin-1') as csvfile:
             reader = csv.DictReader(csvfile)
             admin_required_cols = ["Name Schema", "Admin", "netid"]
             admin_missing_cols = [col for col in admin_required_cols if col not in reader.fieldnames]
@@ -1056,6 +1140,8 @@ def main():
                 continue
 
         # --- User Lookup and Checkout Logic (Prioritized) ---
+        # This logic now ONLY looks up users in the already synchronized snipeit_users cache.
+        # It does NOT attempt to create users here.
         
         user_name_for_assignment = None
         snipeit_target_user_info = None
@@ -1072,14 +1158,19 @@ def main():
             
             if found_user_in_directory_csv_primary:
                 target_employee_id_primary = found_user_in_directory_csv_primary.get(USER_EMPLOYEE_ID_COLUMN, '').strip()
+                # Check snipeit_users by Employee ID first, then by username (NetID)
                 if target_employee_id_primary and target_employee_id_primary in snipeit_users:
                     snipeit_target_user_info = snipeit_users[target_employee_id_primary]
                     user_name_for_assignment = bigfix_primary_user_name
-                    file_logger.info(f"  User found via Priority 1 (Primary 'User Name'): '{user_name_for_assignment}'")
+                    file_logger.info(f"  User found via Priority 1 (Primary 'User Name') using Employee ID: '{user_name_for_assignment}'")
+                elif bigfix_primary_user_name.lower() in snipeit_users: # Check by username key if employee_id not found
+                    snipeit_target_user_info = snipeit_users[bigfix_primary_user_name.lower()]
+                    user_name_for_assignment = bigfix_primary_user_name
+                    file_logger.info(f"  User found via Priority 1 (Primary 'User Name') using NetID key: '{user_name_for_assignment}'")
                 else:
-                    file_logger.info(f"  Priority 1: Primary BigFix user '{bigfix_primary_user_name}' found in directory but not in Snipe-IT (Employee ID {target_employee_id_primary} not in cache). Moving to Priority 2.")
+                    file_logger.info(f"  Priority 1: Primary BigFix user '{bigfix_primary_user_name}' found in directory data but NOT in Snipe-IT. Moving to Priority 2. (User must be synced first)")
             else:
-                file_logger.info(f"  Priority 1: Primary BigFix user '{bigfix_primary_user_name}' not found in directory. Moving to Priority 2.")
+                file_logger.info(f"  Priority 1: Primary BigFix user '{bigfix_primary_user_name}' not found in directory data. Moving to Priority 2.")
         else:
             file_logger.info(f"  Priority 1: Primary 'User Name' column is empty. Moving to Priority 2.")
 
@@ -1092,8 +1183,9 @@ def main():
                 file_logger.info(f"  Priority 2: Fallback lookup identified '{best_fallback_netid}' as the best candidate.")
                 user_name_for_assignment = best_fallback_netid
                 
+                # Check snipeit_users by Employee ID first, then by username (NetID)
                 found_in_snipeit_cache = False
-                for dir_row in directory_data_for_user_lookup:
+                for dir_row in directory_data_for_user_lookup: # Iterate dir_data to get employee_id for lookup
                     if dir_row.get(USER_EMPLOYEE_NET_ID_COLUMN, '').strip().lower() == best_fallback_netid:
                         employee_id_from_dir_p2 = dir_row.get(USER_EMPLOYEE_ID_COLUMN, '').strip()
                         if employee_id_from_dir_p2 and employee_id_from_dir_p2 in snipeit_users:
@@ -1101,15 +1193,13 @@ def main():
                             found_in_snipeit_cache = True
                             break
                 
-                if not found_in_snipeit_cache:
-                    for user_data in snipeit_users.values():
-                        if user_data.get('username') == user_name_for_assignment.lower():
-                            snipeit_target_user_info = user_data
-                            found_in_snipeit_cache = True
-                            break
+                if not found_in_snipeit_cache: # Also check by username key if employee_id didn't match
+                    if user_name_for_assignment.lower() in snipeit_users:
+                        snipeit_target_user_info = snipeit_users[user_name_for_assignment.lower()]
+                        found_in_snipeit_cache = True
 
                 if not found_in_snipeit_cache:
-                    file_logger.info(f"  Warning: Priority 2 NetID '{user_name_for_assignment}' found in directory but not in Snipe-IT cache. Moving to Priority 3.")
+                    file_logger.info(f"  Warning: Priority 2 NetID '{user_name_for_assignment}' found in directory data but NOT in Snipe-IT. Moving to Priority 3. (User must be synced first)")
             else:
                 file_logger.info(f"  Priority 2: No suitable user found after fallback lookup for asset {serial}. Moving to Priority 3.")
         
@@ -1131,15 +1221,21 @@ def main():
                     
                     if dir_match_third_priority:
                         target_employee_id_third_priority = dir_row.get(USER_EMPLOYEE_ID_COLUMN, '').strip()
+                        # Check snipeit_users by Employee ID first, then by username (NetID)
                         if target_employee_id_third_priority and target_employee_id_third_priority in snipeit_users:
                             snipeit_target_user_info = snipeit_users[target_employee_id_third_priority]
                             user_name_for_assignment = extracted_netid
                             assigned_via_priority_3 += 1 
-                            file_logger.info(f"  User found via Priority 3 (Computer Name) and validated: '{user_name_for_assignment}'")
+                            file_logger.info(f"  User found via Priority 3 (Computer Name) using Employee ID: '{user_name_for_assignment}'")
+                        elif extracted_netid.lower() in snipeit_users: # Check by username key if employee_id not found
+                            snipeit_target_user_info = snipeit_users[extracted_netid.lower()]
+                            user_name_for_assignment = extracted_netid
+                            assigned_via_priority_3 += 1
+                            file_logger.info(f"  User found via Priority 3 (Computer Name) using NetID key: '{user_name_for_assignment}'")
                         else:
-                            file_logger.info(f"  Priority 3: Computer Name NetID '{extracted_netid}' found in directory but not in Snipe-IT (Employee ID {target_employee_id_third_priority} not in cache). Moving to Priority 4.")
+                            file_logger.info(f"  Priority 3: Computer Name NetID '{extracted_netid}' found in directory data but NOT in Snipe-IT. Moving to Priority 4. (User must be synced first)")
                     else:
-                        file_logger.info(f"  Priority 3: Computer Name NetID '{extracted_netid}' not found in directory. Moving to Priority 4.")
+                        file_logger.info(f"  Priority 3: Computer Name NetID '{extracted_netid}' not found in directory data. Moving to Priority 4.")
                 else:
                     file_logger.debug(f"  Priority 3: Computer Name '{computer_name_for_asset}' does not have a valid 'ENG-NetID' structure for extraction using split logic. Moving to Priority 4.")
             else:
@@ -1173,13 +1269,10 @@ def main():
                             snipeit_target_user_info = snipeit_users[employee_id_from_dir_p4]
                             user_name_for_assignment = admin_netid
                             snipeit_user_exists_p4 = True
-                        else: # Fallback to username if EmployeeID didn't match or was missing
-                            for user_data in snipeit_users.values():
-                                if user_data.get('username') == admin_netid: 
-                                    snipeit_target_user_info = user_data
-                                    user_name_for_assignment = admin_netid
-                                    snipeit_user_exists_p4 = True
-                                    break
+                        elif admin_netid in snipeit_users: # Fallback to username if EmployeeID didn't match or was missing
+                            snipeit_target_user_info = snipeit_users[admin_netid]
+                            user_name_for_assignment = admin_netid
+                            snipeit_user_exists_p4 = True
                         
                         if snipeit_user_exists_p4:
                             assigned_via_priority_4 += 1
@@ -1187,9 +1280,9 @@ def main():
                             found_p4_match = True
                             break # Found a match and assigned, stop checking other schemas for this device
                         else:
-                            file_logger.info(f"  Priority 4: Admin NetID '{admin_netid}' found in directory but not in Snipe-IT. Skipping assignment for this schema.")
+                            file_logger.info(f"  Priority 4: Admin NetID '{admin_netid}' found in directory data but NOT in Snipe-IT. Skipping assignment for this schema. (User must be synced first)")
                     else:
-                        file_logger.info(f"  Priority 4: Admin NetID '{admin_netid}' from schema '{name_schema}' not found in directory. Skipping assignment for this schema.")
+                        file_logger.info(f"  Priority 4: Admin NetID '{admin_netid}' from schema '{name_schema}' not found in directory data. Skipping assignment for this schema.")
             
             if not found_p4_match:
                 file_logger.info(f"  Priority 4: No suitable Multi-User Admin schema match found for asset {serial}.")
@@ -1277,7 +1370,7 @@ def main():
                         file_logger.info(f"     Attempting to force status update to '{CHECKED_OUT_STATUS_LABEL}'.")
                         update_notes = f"Forced status update after BigFix-driven checkout. Last BigFix Report: {bigfix_last_report_time.strftime('%Y-%m-%d %H:%M:%S')}"
                         if update_asset_status(asset_id_for_workflow, checked_out_status_id, update_notes):
-                            file_logger.info(f"  Successfully forced status to '{CHECKED_OUT_STATUS_LABEL}'.")
+                            file_logger.info(f"  Successfully forced status to '{CHECKED_OUT_STATUS_LABEL}'.") # Corrected variable name
                         else:
                             file_logger.error(f"  Failed to force status to '{CHECKED_OUT_STATUS_LABEL}'. Manual intervention may be needed.")
                 else:
@@ -1287,6 +1380,8 @@ def main():
             if asset_id_for_workflow:
                 file_logger.info(f"No BigFix username or suitable fallback user found for asset {serial}. Skipping user association/checkout.")
                 assets_skipped_final_count += 1
+
+    # Removed: Logic to write user addition results to CSV
 
     console_logger.info(f"\n--- Sync Summary ---")
     console_logger.info(f"Manufacturers Added: {manufacturers_added_count}")
