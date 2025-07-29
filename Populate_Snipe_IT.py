@@ -226,18 +226,18 @@ def create_snipeit_asset(asset_data):
         response = requests.post(url, headers=HEADERS, json=asset_data)
         response.raise_for_status()
         file_logger.info(f"Successfully created asset: {asset_data['asset_tag']} - {asset_data.get('name', 'N/A')}")
-        return response.json()
+        return response.json() # Returns the full JSON response on success
     except requests.exceptions.RequestException as e:
         if response is not None and response.json():
             response_json = response.json()
             if 'messages' in response_json and 'asset_tag' in response_json['messages'] and 'already been taken' in response_json['messages']['asset_tag'][0]:
                 file_logger.info(f"Asset with tag '{asset_data['asset_tag']}' already exists in Snipe-IT. Skipping creation.")
-                return None
+                return None # Returns None here
             file_logger.error(f"Error creating asset {asset_data.get('name', 'N/A')}: {e}")
             file_logger.error(f"Snipe-IT API response: {response_json}")
         else:
             file_logger.error(f"Error creating asset {asset_data.get('name', 'N/A')}: {e} (No JSON response body)")
-        return None
+        return None # Returns None here for other errors
     finally:
         time.sleep(REQUEST_DELAY_SECONDS)
 
@@ -553,7 +553,7 @@ def find_best_netid(row, directory_data_for_user_lookup, snipeit_users):
     
     return None 
 
-def sync_directory_users_to_snipeit(directory_data_for_user_lookup, snipeit_users): # Removed user_addition_results parameter
+def sync_directory_users_to_snipeit(directory_data_for_user_lookup, snipeit_users):
     """
     Reads the directory export CSV, checks for user existence in Snipe-IT,
     and attempts to create new users if they don't exist.
@@ -580,7 +580,6 @@ def sync_directory_users_to_snipeit(directory_data_for_user_lookup, snipeit_user
             if user_missing_cols:
                 reason = f"Missing required user columns in '{DIRECTORY_CSV_FILE}': {', '.join(user_missing_cols)}. Available: {', '.join(reader.fieldnames)}"
                 file_logger.error(f"Error: {reason}")
-                # No longer appending to user_addition_results
                 return users_added_count, users_skipped_count # Exit early if critical CSV error
 
             for row_num, row in enumerate(reader, start=2):
@@ -589,8 +588,6 @@ def sync_directory_users_to_snipeit(directory_data_for_user_lookup, snipeit_user
                 first_name = row.get(USER_FIRST_NAME_COLUMN)
                 last_name = row.get(USER_LAST_NAME_COLUMN)
                 email = row.get(USER_EMAIL_COLUMN)
-
-                # Removed: user_add_result dictionary initialization
 
                 # --- Basic validation for user data ---
                 if not all([employee_id, employee_net_id, first_name, last_name, email]):
@@ -604,7 +601,6 @@ def sync_directory_users_to_snipeit(directory_data_for_user_lookup, snipeit_user
                     reason = f"Missing required user data: {', '.join(missing_fields)}"
                     file_logger.warning(f"Skipping user in row {row_num}: {reason} for '{employee_net_id}' (ID: {employee_id}).")
                     users_skipped_count += 1
-                    # No longer appending to user_addition_results
                     continue
                 
                 # Strip whitespace from relevant fields
@@ -655,7 +651,6 @@ def sync_directory_users_to_snipeit(directory_data_for_user_lookup, snipeit_user
                     file_logger.info(f"  Attempted: NetID='{employee_net_id}', EmployeeID='{employee_id}', Email='{email}'")
                     file_logger.info(f"  Existing: NetID='{duplicate_user_info.get('username', 'N/A')}', EmployeeID='{duplicate_user_info.get('employee_num', 'N/A')}', Email='{duplicate_user_info.get('email', 'N/A')}'")
                     users_skipped_count += 1
-                    # No longer appending to user_addition_results
                     continue
 
                 # If no duplicates found by any criteria, proceed to create user
@@ -691,19 +686,15 @@ def sync_directory_users_to_snipeit(directory_data_for_user_lookup, snipeit_user
                     if employee_id.lower() != employee_net_id.lower(): # Avoid redundant key if employee_id and netid are the same
                         snipeit_users[employee_net_id.lower()] = snipeit_users[employee_id]
 
-                    # No longer appending to user_addition_results
                 else:
                     users_skipped_count += 1
                     reason = created_user_response.get('message', 'Unknown API error') if created_user_response else 'Unknown error during API call or no response'
                     file_logger.error(f"Failed to create user {employee_net_id} (ID: {employee_id}): {reason}")
-                    # No longer appending to user_addition_results
 
     except FileNotFoundError:
         file_logger.error(f"Error: Directory export CSV file '{DIRECTORY_CSV_FILE}' not found. Skipping user import.")
-        # No longer appending to user_addition_results
     except Exception as e:
         file_logger.exception(f"An error occurred while reading the directory CSV file: {e}")
-        # No longer appending to user_addition_results
     
     return users_added_count, users_skipped_count
 
@@ -737,9 +728,6 @@ def main():
 
     cleanup_old_logs(log_dir, max_logs=30)
 
-    # Removed: Clean up old user addition log CSVs logic
-    # Removed: console_logger.info(f"User addition results will be saved to: {USER_ADDITION_LOG_CSV}")
-
     console_logger.info(f"") 
     console_logger.info(f"=====================================================================")
     console_logger.info(f"                 Snipe-IT Sync Script Started!")
@@ -764,7 +752,6 @@ def main():
     snipeit_assets = {}
     snipeit_users = {} # Dictionary to store existing users
     directory_data_for_user_lookup = [] # List to store directory data for user lookup during asset assignment
-    # Removed: user_addition_results = [] # New: List to store data for user addition CSV
 
     eng_format_devices_found = 0
     assigned_via_priority_3 = 0
@@ -1125,7 +1112,13 @@ def main():
             file_logger.debug(f"DEBUG: Attempting to create asset with Tag: '{asset_payload['asset_tag']}', Name: '{asset_payload['name']}', Company ID: '{asset_payload['company_id']}'")
 
             created_asset_response = create_snipeit_asset(asset_payload)
-            if created_asset_response:
+            # Robust check for successful asset creation response structure
+            if created_asset_response and \
+               isinstance(created_asset_response, dict) and \
+               created_asset_response.get('payload') and \
+               isinstance(created_asset_response['payload'], dict) and \
+               created_asset_response['payload'].get('id'):
+                
                 assets_added_count += 1
                 asset_id_for_workflow = created_asset_response['payload']['id']
                 snipeit_assets[serial_upper] = {
@@ -1135,7 +1128,14 @@ def main():
                     'checked_out_to_id': None
                 }
             else:
-                file_logger.info(f"Skipping user association for asset {serial} as it was not created successfully.")
+                # Log why it failed more specifically if possible
+                reason = "Unknown error or invalid response from Snipe-IT API during asset creation."
+                if created_asset_response and isinstance(created_asset_response, dict):
+                    reason = f"API response indicates failure or missing payload: {created_asset_response.get('messages', created_asset_response)}"
+                elif created_asset_response is None:
+                    reason = "Asset creation API call returned None (e.g., asset already exists or API error)."
+                
+                file_logger.info(f"Skipping user association for asset {serial} as it was not created successfully. Reason: {reason}")
                 assets_skipped_final_count += 1
                 continue
 
@@ -1163,7 +1163,7 @@ def main():
                     snipeit_target_user_info = snipeit_users[target_employee_id_primary]
                     user_name_for_assignment = bigfix_primary_user_name
                     file_logger.info(f"  User found via Priority 1 (Primary 'User Name') using Employee ID: '{user_name_for_assignment}'")
-                elif bigfix_primary_user_name.lower() in snipeit_users: # Check by username key if employee_id not found
+                elif bigfix_primary_user_name.lower() in snipeit_users: # Check by username key if employee_id didn't match or was missing
                     snipeit_target_user_info = snipeit_users[bigfix_primary_user_name.lower()]
                     user_name_for_assignment = bigfix_primary_user_name
                     file_logger.info(f"  User found via Priority 1 (Primary 'User Name') using NetID key: '{user_name_for_assignment}'")
@@ -1380,8 +1380,6 @@ def main():
             if asset_id_for_workflow:
                 file_logger.info(f"No BigFix username or suitable fallback user found for asset {serial}. Skipping user association/checkout.")
                 assets_skipped_final_count += 1
-
-    # Removed: Logic to write user addition results to CSV
 
     console_logger.info(f"\n--- Sync Summary ---")
     console_logger.info(f"Manufacturers Added: {manufacturers_added_count}")
