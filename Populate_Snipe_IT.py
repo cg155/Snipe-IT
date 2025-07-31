@@ -662,7 +662,7 @@ def sync_directory_users_to_snipeit(directory_data_for_user_lookup, snipeit_user
                     'email': email,
                     'password': SNIPEIT_USER_PASSWORD,
                     'password_confirmation': SNIPEIT_USER_PASSWORD,
-                    'activated': True,
+                    'activated': False,
                     'can_login': False,
                     'ldap_import': True
                 }
